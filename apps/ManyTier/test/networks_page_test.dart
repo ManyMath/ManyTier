@@ -233,7 +233,7 @@ void main() {
       await _useTallSurface(tester);
       await _settle(tester);
 
-      expect(find.textContaining('only manage local daemon'), findsOneWidget);
+      expect(find.textContaining('only start and stop a local daemon'), findsOneWidget);
       final start = find.widgetWithText(MButton, 'Start service');
       expect(tester.widget<MButton>(start).onPressed, isNull);
       expect(starter.starts, isEmpty);
