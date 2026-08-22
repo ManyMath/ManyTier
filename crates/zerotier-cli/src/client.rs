@@ -59,8 +59,80 @@ impl ApiClient {
         let mut response = String::new();
         stream.read_to_string(&mut response).await?;
 
-        // Parse HTTP response -- extract body after \r\n\r\n
-        let body_start = response.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-        Ok(response[body_start..].to_string())
+        parse_response(method, path, &response)
+    }
+}
+
+/// Split a raw HTTP/1.1 response into status and body, failing on any status
+/// outside 2xx so callers do not report success for a request the service
+/// rejected (a missing moon file, an unknown network, a bad auth token).
+fn parse_response(method: &str, path: &str, response: &str) -> anyhow::Result<String> {
+    let (head, body) = match response.find("\r\n\r\n") {
+        Some(i) => (&response[..i], &response[i + 4..]),
+        None => (response, ""),
+    };
+    let status_line = head.lines().next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("malformed HTTP response to {method} {path}: {status_line:?}")
+        })?;
+    if !(200..300).contains(&status) {
+        let detail = body.trim();
+        let hint = match (status, path) {
+            (404, p) if p.starts_with("/moon/") => {
+                " (moon file not found: place <moon-id>.moon in <data-dir>/moons.d/ first)"
+            }
+            (401, _) => " (bad auth token)",
+            _ => "",
+        };
+        anyhow::bail!(
+            "{method} {path} failed with HTTP {status}{hint}{}{}",
+            if detail.is_empty() { "" } else { ": " },
+            detail
+        );
+    }
+    Ok(body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response;
+
+    #[test]
+    fn accepts_2xx_and_returns_body() {
+        let body = parse_response(
+            "GET",
+            "/status",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .unwrap();
+        assert_eq!(body, "{}");
+    }
+
+    #[test]
+    fn rejects_non_2xx_with_status_and_hint() {
+        let err = parse_response(
+            "POST",
+            "/moon/0000002105b78c5f",
+            "HTTP/1.1 404 Not Found\r\n\r\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HTTP 404"), "{err}");
+        assert!(err.contains("moons.d"), "{err}");
+
+        let err = parse_response("GET", "/status", "HTTP/1.1 401 Unauthorized\r\n\r\nnope")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HTTP 401"), "{err}");
+        assert!(err.ends_with(": nope"), "{err}");
+    }
+
+    #[test]
+    fn rejects_malformed_status_line() {
+        assert!(parse_response("GET", "/status", "garbage").is_err());
     }
 }
