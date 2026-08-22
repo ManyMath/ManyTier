@@ -21,7 +21,6 @@ getrandom = { workspace = true }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
-tun2 = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,3 +29,12 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 lz4_flex = { workspace = true }
+
+# TUN backends are platform specific: Linux goes through /dev/net/tun via
+# tun2; macOS talks to the utun kernel control directly with libc. libc is
+# also used on every unix for interface enumeration (getifaddrs).
+[target.'cfg(target_os = "linux")'.dependencies]
+tun2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

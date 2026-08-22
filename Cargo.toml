@@ -44,6 +44,7 @@ serde = { version = "1.0", default-features = false, features = ["alloc", "deriv
 # Native-only deps (behind feature flag)
 tokio = { version = "1.37", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tun2 = { version = "=1.2.0", features = ["async"] }
+libc = "0.2"
 socket2 = "0.5"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 getrandom = { version = "0.2", default-features = false }
