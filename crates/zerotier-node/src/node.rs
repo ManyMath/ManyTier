@@ -585,6 +585,14 @@ impl Node {
 
     /// Send WHOIS requests to roots for the given addresses.
     /// Returns SendTo actions with the WHOIS packets.
+    /// Identity already validated for this address?
+    fn identity_already_validated(&self, identity: &Identity) -> bool {
+        self.topology
+            .get_peer(identity.address.as_bytes())
+            .map(|peer| peer.identity.public_key.to_bytes() == identity.public_key.to_bytes())
+            .unwrap_or(false)
+    }
+
     pub fn send_whois(&mut self, addresses: &[[u8; 5]], now_ms: u64) -> Vec<NodeAction> {
         let mut actions = Vec::new();
         for root_addr in &self.topology.roots.clone() {
@@ -1086,8 +1094,10 @@ impl Node {
         // claimed public key: otherwise a peer could pair any public key with
         // any address of its choosing, breaking address-uniqueness guarantees
         // (WHOIS answers, COM address binding, etc.) that a valid MAC alone
-        // does not establish.
-        if !hello.identity.validate_address() {
+        // does not establish. Validation is memory-hard, so as in ZeroTier One
+        // it runs only for an identity not already held for that address.
+        if !self.identity_already_validated(&hello.identity) && !hello.identity.validate_address()
+        {
             tracing::debug!(
                 target: "manytier",
                 event = "hello_address_validation_failed",
@@ -1203,7 +1213,7 @@ impl Node {
             OkSubPayload::Whois { identities } => {
                 // Add learned identities to topology and initiate HELLO
                 for id in identities {
-                    if !id.validate_address() {
+                    if !self.identity_already_validated(&id) && !id.validate_address() {
                         tracing::debug!(
                             target: "manytier",
                             event = "whois_address_validation_failed",
@@ -4503,6 +4513,62 @@ mod tests {
             "peer must be promoted to Active after a valid HELLO, got {:?}",
             peer.state
         );
+    }
+
+    #[test]
+    fn handle_hello_known_address_with_different_key_is_still_validated() {
+        let (client, controller, _shared, hello_bytes) = build_hello_verification_env(44);
+
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(controller.clone(), &planet, 1).unwrap();
+        let client_addr = *client.address.as_bytes();
+        let from: SocketAddr = "10.0.0.2:9993".parse().unwrap();
+
+        // Learn the genuine identity first (validated on this first HELLO).
+        let mut data = hello_bytes.clone();
+        node.receive_packet(&mut data, from, 2000);
+        assert!(node.topology.get_peer(&client_addr).is_some());
+
+        // Impostor: same address, different key. The MAC verifies, so only
+        // address validation can reject it.
+        let mut rng = XorShift17_11(4444);
+        let impostor = Identity::generate(&mut rng).unwrap();
+        let forged = Identity {
+            address: client.address,
+            public_key: impostor.public_key.clone(),
+            secret: impostor.secret.clone(),
+        };
+        let forged_secret = forged.secret.as_ref().unwrap();
+        let controller_pub = x25519_dalek::PublicKey::from(controller.public_key.dh);
+        let forged_shared =
+            zerotier_crypto::key_agreement::key_agree(&forged_secret.dh, &controller_pub);
+        let mut buf = [0u8; 512];
+        let (len, _) = RootManager::build_hello(
+            &forged,
+            controller.address.as_bytes(),
+            "127.0.0.1:9993".parse().unwrap(),
+            3000,
+            &forged_shared,
+            &mut buf,
+            zerotier_protocol::constants::WORLD_ID_EARTH,
+            0,
+        )
+        .unwrap();
+        let mut forged_hello = buf[..len].to_vec();
+        node.receive_packet(&mut forged_hello, from, 4000);
+
+        let peer = node.topology.get_peer(&client_addr).unwrap();
+        assert_eq!(
+            peer.identity.public_key.to_bytes(),
+            client.public_key.to_bytes(),
+            "a forged key for a known address must not replace the validated identity"
+        );
+
+        // A repeat of the genuine HELLO is still accepted.
+        let mut data = hello_bytes.clone();
+        node.receive_packet(&mut data, from, 5000);
+        let peer = node.topology.get_peer(&client_addr).unwrap();
+        assert!(matches!(peer.state, PeerState::Active { .. }));
     }
 
     #[test]
