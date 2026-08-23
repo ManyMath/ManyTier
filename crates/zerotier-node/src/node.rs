@@ -585,6 +585,13 @@ impl Node {
 
     /// Send WHOIS requests to roots for the given addresses.
     /// Returns SendTo actions with the WHOIS packets.
+    /// Zero-hop packets come from the sender's own address.
+    fn arrived_directly(data: &[u8]) -> bool {
+        PacketHeader::from_bytes(data)
+            .map(|header| header.hops() == 0)
+            .unwrap_or(false)
+    }
+
     /// Identity already validated for this address?
     fn identity_already_validated(&self, identity: &Identity) -> bool {
         self.topology
@@ -1127,7 +1134,7 @@ impl Node {
 
             // Update peer state
             if let Some(peer) = self.topology.get_peer_mut(&source_addr_bytes) {
-                peer.add_path(from, true, now_ms);
+                peer.add_path(from, Self::arrived_directly(data), now_ms);
                 peer.state = PeerState::new_active(shared_secret, 0, now_ms, now_ms);
             }
 
@@ -1165,6 +1172,7 @@ impl Node {
     /// OK(HELLO): compute latency from timestamp echo, establish peer session.
     /// OK(WHOIS): add learned identities to topology.
     fn handle_ok(&mut self, data: &[u8], from: SocketAddr, now_ms: u64) {
+        let direct = Self::arrived_directly(data);
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
         let ok = match OkPayload::deserialize(payload_data) {
             Ok(o) => o,
@@ -1193,7 +1201,7 @@ impl Node {
                         peer.state =
                             PeerState::new_active(shared_secret, latency_ms, now_ms, now_ms);
                     }
-                    peer.add_path(from, true, now_ms);
+                    peer.add_path(from, direct, now_ms);
 
                     tracing::info!(
                         target: "manytier",
@@ -1469,7 +1477,7 @@ impl Node {
                 }
             }
             // Also add the path we received this from
-            peer.add_path(from, true, now_ms);
+            peer.add_path(from, Self::arrived_directly(data), now_ms);
         }
     }
 
@@ -4569,6 +4577,47 @@ mod tests {
         node.receive_packet(&mut data, from, 5000);
         let peer = node.topology.get_peer(&client_addr).unwrap();
         assert!(matches!(peer.state, PeerState::Active { .. }));
+    }
+
+    #[test]
+    fn relayed_hello_records_a_relay_path_not_a_direct_one() {
+        let (client, controller, _shared, hello_bytes) = build_hello_verification_env(45);
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(controller, &planet, 1).unwrap();
+        let client_addr = *client.address.as_bytes();
+        let relay: SocketAddr = "198.51.100.9:9993".parse().unwrap();
+
+        // The same HELLO forwarded by a root arrives with hops = 1.
+        let mut relayed = hello_bytes.clone();
+        relayed[18] |= 1;
+        node.receive_packet(&mut relayed, relay, 2000);
+        let peer = node.topology.get_peer(&client_addr).expect("peer added");
+        let path = peer
+            .paths
+            .iter()
+            .find(|path| path.address == relay)
+            .expect("relay path recorded so we can answer through the root");
+        assert!(
+            !path.is_direct,
+            "a relayed packet must not create a direct path"
+        );
+
+        // Delivered directly (hops = 0) from the peer's own address it is direct.
+        let direct_from: SocketAddr = "192.168.1.110:9993".parse().unwrap();
+        let mut direct = hello_bytes.clone();
+        node.receive_packet(&mut direct, direct_from, 3000);
+        let peer = node.topology.get_peer(&client_addr).unwrap();
+        let path = peer
+            .paths
+            .iter()
+            .find(|path| path.address == direct_from)
+            .expect("direct path recorded");
+        assert!(path.is_direct);
+        assert_eq!(
+            peer.best_path(3000).map(|path| path.address),
+            Some(direct_from),
+            "the direct path must be preferred over the relay"
+        );
     }
 
     #[test]
