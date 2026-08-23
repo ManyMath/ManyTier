@@ -50,6 +50,9 @@ pub enum NodeAction {
     SendTo { data: Vec<u8>, address: SocketAddr },
     /// Request the caller to resolve these ZeroTier addresses via WHOIS.
     WhoisNeeded { addresses: Vec<[u8; 5]> },
+    /// Destination IP not in the member directory; a config refresh was
+    /// requested. Hold the packet.
+    DestinationUnknown { network_id: u64 },
     /// An Ethernet frame was received from the virtual network, ready to write to TUN.
     /// Contains raw payload (ethertype indicates IPv4/IPv6/ARP).
     FrameReceived {
@@ -1917,6 +1920,174 @@ impl Node {
         }
     }
 
+    /// Queue due NETWORK_CONFIG_REQUESTs, rate limited per network.
+    fn queue_config_requests(&mut self, now_ms: u64) {
+        const CONFIG_REQUEST_INTERVAL_MS: u64 = 30_000;
+        let our_address_bytes = *self.identity.address.as_bytes();
+        let config_requests: Vec<(u64, [u8; 5], bool)> = self
+            .networks
+            .iter_mut()
+            .filter_map(|net| {
+                let is_refresh = net.our_com.is_some();
+                if !net.our_com_refresh_due(now_ms) && !net.pending_config_request {
+                    return None;
+                }
+                net.pending_config_request = true;
+                if net.last_config_request != 0
+                    && now_ms.saturating_sub(net.last_config_request) < CONFIG_REQUEST_INTERVAL_MS
+                {
+                    return None;
+                }
+
+                let ctrl_addr = controller_address_from_network_id(net.network_id);
+                Some((net.network_id, ctrl_addr, is_refresh))
+            })
+            .collect();
+
+        for (network_id, ctrl_addr, is_refresh) in &config_requests {
+            let dest_addr = self
+                .topology
+                .get_peer(ctrl_addr)
+                .and_then(|p| p.paths.first())
+                .map(|path| path.address)
+                .or_else(|| {
+                    // Fall back to first root as relay
+                    self.topology.roots.first().and_then(|root_addr| {
+                        self.topology
+                            .get_peer(root_addr)
+                            .and_then(|p| p.paths.first())
+                            .map(|path| path.address)
+                    })
+                });
+
+            if let Some(phys_addr) = dest_addr {
+                // Only send NCR after an active HELLO session with the controller.
+                // Sending before OK(HELLO) means the controller hasn't verified our
+                // identity yet and will silently drop the encrypted packet.
+                let peer_active = self
+                    .topology
+                    .get_peer(ctrl_addr)
+                    .is_some_and(|p| matches!(p.state, PeerState::Active { .. }));
+                if !peer_active {
+                    // A hosted/remote controller is not in our planet or moons, so
+                    // nothing else ever resolves its identity. Request WHOIS via the
+                    // roots here; the OK(WHOIS) handler then sends a relayed HELLO,
+                    // and once the session is Active the NCR goes out on a later tick.
+                    const CONTROLLER_WHOIS_RETRY_INTERVAL_MS: u64 = 10_000;
+                    let whois_due = match self.topology.pending_whois.get(ctrl_addr) {
+                        Some((sent_ms, _)) => {
+                            now_ms.saturating_sub(*sent_ms) >= CONTROLLER_WHOIS_RETRY_INTERVAL_MS
+                        }
+                        None => true,
+                    };
+                    if whois_due {
+                        self.topology.pending_whois.insert(*ctrl_addr, (now_ms, 0));
+                        tracing::info!(
+                            target: "manytier",
+                            event = "controller_whois_requested",
+                            network_id = %format_args!("{:016x}", network_id),
+                            controller = %format_args!(
+                                "{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                ctrl_addr[0],
+                                ctrl_addr[1],
+                                ctrl_addr[2],
+                                ctrl_addr[3],
+                                ctrl_addr[4]
+                            ),
+                            "requesting WHOIS for controller before NETWORK_CONFIG_REQUEST"
+                        );
+                        self.actions.push(NodeAction::WhoisNeeded {
+                            addresses: vec![*ctrl_addr],
+                        });
+                    }
+                    tracing::debug!(
+                        target: "manytier",
+                        event = "ncr_deferred_no_session",
+                        controller = %format_args!(
+                            "{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            ctrl_addr[0],
+                            ctrl_addr[1],
+                            ctrl_addr[2],
+                            ctrl_addr[3],
+                            ctrl_addr[4]
+                        ),
+                        "deferring NETWORK_CONFIG_REQUEST: no active session with controller"
+                    );
+                    continue;
+                }
+                let shared_secret = match self.shared_secret_for_peer(ctrl_addr) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let req = zerotier_protocol::verbs::network_config::NetworkConfigRequestPayload {
+                    network_id: *network_id,
+                    dict_data: build_network_config_request_metadata(),
+                };
+
+                let mut payload = [0u8; 512];
+                let payload_len = req.serialize(&mut payload);
+                let packet_id = self.allocate_packet_id();
+                if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
+                    packet_id,
+                    &our_address_bytes,
+                    ctrl_addr,
+                    Verb::NetworkConfigRequest,
+                    &payload[..payload_len],
+                    &shared_secret,
+                ) {
+                    tracing::info!(
+                        target: "manytier",
+                        event = "config_request_sent",
+                        network_id = %format_args!("{:016x}", network_id),
+                        refresh = *is_refresh,
+                        controller = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            ctrl_addr[0], ctrl_addr[1], ctrl_addr[2], ctrl_addr[3], ctrl_addr[4]),
+                        physical_address = %phys_addr,
+                        "sent NETWORK_CONFIG_REQUEST"
+                    );
+                    self.actions.push(NodeAction::SendTo {
+                        data: packet,
+                        address: phys_addr,
+                    });
+                    if let Some(net) = self.find_network_mut(*network_id) {
+                        net.last_config_request = now_ms;
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    target: "manytier",
+                    event = "config_request_no_controller_path",
+                    network_id = %format_args!("{:016x}", network_id),
+                    controller = %format_args!(
+                        "{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        ctrl_addr[0], ctrl_addr[1], ctrl_addr[2], ctrl_addr[3], ctrl_addr[4]
+                    ),
+                    "skipping NETWORK_CONFIG_REQUEST because no controller path or root relay is available"
+                );
+            }
+        }
+    }
+
+    /// Send due NETWORK_CONFIG_REQUESTs now.
+    pub fn flush_config_requests(&mut self, now_ms: u64) -> Vec<NodeAction> {
+        let saved = core::mem::take(&mut self.actions);
+        self.queue_config_requests(now_ms);
+        core::mem::replace(&mut self.actions, saved)
+    }
+
+    /// Request a config refresh for an IP missing from the directory.
+    pub fn note_unknown_destination(&mut self, network_id: u64, now_ms: u64) {
+        const UNKNOWN_DESTINATION_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+        if let Some(net) = self.find_network_mut(network_id) {
+            net.pending_config_request = true;
+            if now_ms.saturating_sub(net.last_config_request)
+                >= UNKNOWN_DESTINATION_REFRESH_MIN_INTERVAL_MS
+            {
+                net.last_config_request = 0;
+            }
+        }
+    }
+
     /// Periodic maintenance: send keepalives, retry HELLOs, evict stale peers.
     ///
     /// Called every ZT_PING_CHECK_INTERVAL (5s). Performs:
@@ -1926,7 +2097,6 @@ impl Node {
     /// 4. Path heartbeat (14s interval)
     /// 5. Root reconnection for disconnected roots
     pub fn tick(&mut self, now_ms: u64) -> Vec<NodeAction> {
-        const CONFIG_REQUEST_INTERVAL_MS: u64 = 30_000;
         const MULTICAST_LIKE_INTERVAL_MS: u64 = 30_000;
         const MULTICAST_GATHER_INTERVAL_MS: u64 = 45_000;
         const MULTICAST_SUBSCRIPTION_MAX_AGE_MS: u64 = 90_000;
@@ -2209,149 +2379,8 @@ impl Node {
         }
 
         // 7. Send queued or proactive NETWORK_CONFIG_REQUEST packets.
+        self.queue_config_requests(now_ms);
         let our_address_bytes = *self.identity.address.as_bytes();
-        let config_requests: Vec<(u64, [u8; 5], bool)> = self
-            .networks
-            .iter_mut()
-            .filter_map(|net| {
-                let is_refresh = net.our_com.is_some();
-                if !net.our_com_refresh_due(now_ms) && !net.pending_config_request {
-                    return None;
-                }
-                net.pending_config_request = true;
-                if net.last_config_request != 0
-                    && now_ms.saturating_sub(net.last_config_request) < CONFIG_REQUEST_INTERVAL_MS
-                {
-                    return None;
-                }
-
-                let ctrl_addr = controller_address_from_network_id(net.network_id);
-                Some((net.network_id, ctrl_addr, is_refresh))
-            })
-            .collect();
-
-        for (network_id, ctrl_addr, is_refresh) in &config_requests {
-            let dest_addr = self
-                .topology
-                .get_peer(ctrl_addr)
-                .and_then(|p| p.paths.first())
-                .map(|path| path.address)
-                .or_else(|| {
-                    // Fall back to first root as relay
-                    self.topology.roots.first().and_then(|root_addr| {
-                        self.topology
-                            .get_peer(root_addr)
-                            .and_then(|p| p.paths.first())
-                            .map(|path| path.address)
-                    })
-                });
-
-            if let Some(phys_addr) = dest_addr {
-                // Only send NCR after an active HELLO session with the controller.
-                // Sending before OK(HELLO) means the controller hasn't verified our
-                // identity yet and will silently drop the encrypted packet.
-                let peer_active = self
-                    .topology
-                    .get_peer(ctrl_addr)
-                    .is_some_and(|p| matches!(p.state, PeerState::Active { .. }));
-                if !peer_active {
-                    // A hosted/remote controller is not in our planet or moons, so
-                    // nothing else ever resolves its identity. Request WHOIS via the
-                    // roots here; the OK(WHOIS) handler then sends a relayed HELLO,
-                    // and once the session is Active the NCR goes out on a later tick.
-                    const CONTROLLER_WHOIS_RETRY_INTERVAL_MS: u64 = 10_000;
-                    let whois_due = match self.topology.pending_whois.get(ctrl_addr) {
-                        Some((sent_ms, _)) => {
-                            now_ms.saturating_sub(*sent_ms) >= CONTROLLER_WHOIS_RETRY_INTERVAL_MS
-                        }
-                        None => true,
-                    };
-                    if whois_due {
-                        self.topology.pending_whois.insert(*ctrl_addr, (now_ms, 0));
-                        tracing::info!(
-                            target: "manytier",
-                            event = "controller_whois_requested",
-                            network_id = %format_args!("{:016x}", network_id),
-                            controller = %format_args!(
-                                "{:02x}{:02x}{:02x}{:02x}{:02x}",
-                                ctrl_addr[0],
-                                ctrl_addr[1],
-                                ctrl_addr[2],
-                                ctrl_addr[3],
-                                ctrl_addr[4]
-                            ),
-                            "requesting WHOIS for controller before NETWORK_CONFIG_REQUEST"
-                        );
-                        self.actions.push(NodeAction::WhoisNeeded {
-                            addresses: vec![*ctrl_addr],
-                        });
-                    }
-                    tracing::debug!(
-                        target: "manytier",
-                        event = "ncr_deferred_no_session",
-                        controller = %format_args!(
-                            "{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            ctrl_addr[0],
-                            ctrl_addr[1],
-                            ctrl_addr[2],
-                            ctrl_addr[3],
-                            ctrl_addr[4]
-                        ),
-                        "deferring NETWORK_CONFIG_REQUEST: no active session with controller"
-                    );
-                    continue;
-                }
-                let shared_secret = match self.shared_secret_for_peer(ctrl_addr) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let req = zerotier_protocol::verbs::network_config::NetworkConfigRequestPayload {
-                    network_id: *network_id,
-                    dict_data: build_network_config_request_metadata(),
-                };
-
-                let mut payload = [0u8; 512];
-                let payload_len = req.serialize(&mut payload);
-                let packet_id = self.allocate_packet_id();
-                if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
-                    packet_id,
-                    &our_address_bytes,
-                    ctrl_addr,
-                    Verb::NetworkConfigRequest,
-                    &payload[..payload_len],
-                    &shared_secret,
-                ) {
-                    tracing::info!(
-                        target: "manytier",
-                        event = "config_request_sent",
-                        network_id = %format_args!("{:016x}", network_id),
-                        refresh = *is_refresh,
-                        controller = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            ctrl_addr[0], ctrl_addr[1], ctrl_addr[2], ctrl_addr[3], ctrl_addr[4]),
-                        physical_address = %phys_addr,
-                        "sent NETWORK_CONFIG_REQUEST"
-                    );
-                    self.actions.push(NodeAction::SendTo {
-                        data: packet,
-                        address: phys_addr,
-                    });
-                    if let Some(net) = self.find_network_mut(*network_id) {
-                        net.last_config_request = now_ms;
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    target: "manytier",
-                    event = "config_request_no_controller_path",
-                    network_id = %format_args!("{:016x}", network_id),
-                    controller = %format_args!(
-                        "{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        ctrl_addr[0], ctrl_addr[1], ctrl_addr[2], ctrl_addr[3], ctrl_addr[4]
-                    ),
-                    "skipping NETWORK_CONFIG_REQUEST because no controller path or root relay is available"
-                );
-            }
-        }
 
         // 7. Periodically advertise and gather multicast membership.
         let mut due_likes: Vec<(usize, u64, Vec<[u8; 5]>)> = Vec::new();

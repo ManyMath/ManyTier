@@ -45,6 +45,7 @@ pub enum ManyTierFfiActionKind {
     UserMessageReceived = 7,
     RemoteTraceReceived = 8,
     PathNegotiationReceived = 9,
+    DestinationUnknown = 10,
 }
 
 /// Socket address encoded for C callers.
@@ -506,6 +507,11 @@ fn action_view(action: &NodeAction) -> ManyTierFfiActionView {
             data_len: payload.len(),
             network_id: *network_id,
             ethertype: *ethertype,
+            ..ManyTierFfiActionView::default()
+        },
+        NodeAction::DestinationUnknown { network_id } => ManyTierFfiActionView {
+            kind: ManyTierFfiActionKind::DestinationUnknown,
+            network_id: *network_id,
             ..ManyTierFfiActionView::default()
         },
         NodeAction::NetworkConfigured {

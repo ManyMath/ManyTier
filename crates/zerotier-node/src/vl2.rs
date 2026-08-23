@@ -346,6 +346,8 @@ pub fn process_outbound_frame(
     };
 
     let our_mac = network.our_mac(our_zt_address);
+    // Destination IP not in the member directory.
+    let mut unknown_destination = false;
 
     match ethertype {
         ethernet::ETHERTYPE_ARP => {
@@ -404,6 +406,11 @@ pub fn process_outbound_frame(
             if payload.len() >= 20 {
                 let dest_ip =
                     core::net::Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]);
+                if network.lookup_ipv4(dest_ip).is_none() {
+                    unknown_destination = !dest_ip.is_multicast()
+                        && !dest_ip.is_broadcast()
+                        && !is_directed_broadcast_v4(network, dest_ip);
+                }
                 if let Some(member) = network.lookup_ipv4(dest_ip) {
                     let member_address = member.zt_address;
                     let member_mac = member.mac;
@@ -456,6 +463,9 @@ pub fn process_outbound_frame(
                 let mut dst_bytes = [0u8; 16];
                 dst_bytes.copy_from_slice(&payload[24..40]);
                 let dest_ip = core::net::Ipv6Addr::from(dst_bytes);
+                if network.lookup_ipv6(dest_ip).is_none() {
+                    unknown_destination = !dest_ip.is_multicast();
+                }
                 if let Some(member) = network.lookup_ipv6(dest_ip) {
                     let member_address = member.zt_address;
                     let member_mac = member.mac;
@@ -500,7 +510,27 @@ pub fn process_outbound_frame(
         }
     }
 
+    if unknown_destination {
+        // Ask for a fresh config; the caller holds the packet.
+        node.note_unknown_destination(network_id, now_ms);
+        actions.push(NodeAction::DestinationUnknown { network_id });
+    }
+
     actions
+}
+
+/// Directed broadcast of any member's IPv4 prefix.
+fn is_directed_broadcast_v4(
+    network: &crate::network::NetworkMembership,
+    ip: core::net::Ipv4Addr,
+) -> bool {
+    network.members.iter().any(|member| match member.ipv4 {
+        Some((addr, prefix)) if prefix < 32 => {
+            let host_bits = u32::MAX >> prefix;
+            u32::from(ip) == (u32::from(addr) | host_bits)
+        }
+        _ => false,
+    })
 }
 
 /// Check if a peer has a valid COM stored in the network's peer_coms list,
@@ -630,6 +660,84 @@ mod tests {
             &signing_key,
             &public_key_bytes,
         )
+    }
+
+    fn ipv4_packet_to(dst: [u8; 4]) -> alloc::vec::Vec<u8> {
+        let mut packet = alloc::vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 147, 20, 1]);
+        packet[16..20].copy_from_slice(&dst);
+        packet
+    }
+
+    #[test]
+    fn outbound_frame_to_unknown_member_requests_config_refresh() {
+        let network_id = 0xff00000000abcdef_u64;
+        let our_addr = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4];
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        {
+            let net = node.find_network_mut(network_id).unwrap();
+            net.members.push(NetworkMember {
+                zt_address: our_addr,
+                mac: ethernet::derive_mac(&our_addr, network_id),
+                ipv4: Some((core::net::Ipv4Addr::new(10, 147, 20, 1), 24)),
+                ipv6: None,
+                authorized: true,
+            });
+            net.pending_config_request = false;
+            net.last_config_request = 10_000;
+        }
+
+        // A unicast address nobody in the directory owns: hold and refresh.
+        let actions = process_outbound_frame(
+            &mut node,
+            network_id,
+            ethernet::ETHERTYPE_IPV4,
+            &ipv4_packet_to([10, 147, 20, 9]),
+            &our_addr,
+            20_000,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, NodeAction::DestinationUnknown { network_id: id } if *id == network_id)),
+            "unknown unicast destination must be reported, got {actions:?}"
+        );
+        let net = node.find_network(network_id).unwrap();
+        assert!(net.pending_config_request);
+        assert_eq!(
+            net.last_config_request, 0,
+            "refresh must bypass the rate limit"
+        );
+
+        // Multicast and broadcast never trigger a refresh.
+        let net = node.find_network_mut(network_id).unwrap();
+        net.pending_config_request = false;
+        for dst in [[224, 0, 0, 251], [255, 255, 255, 255], [10, 147, 20, 255]] {
+            let actions = process_outbound_frame(
+                &mut node,
+                network_id,
+                ethernet::ETHERTYPE_IPV4,
+                &ipv4_packet_to(dst),
+                &our_addr,
+                30_000,
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, NodeAction::DestinationUnknown { .. })),
+                "{dst:?} must not be treated as an unknown member"
+            );
+        }
+        assert!(
+            !node
+                .find_network(network_id)
+                .unwrap()
+                .pending_config_request
+        );
     }
 
     #[test]

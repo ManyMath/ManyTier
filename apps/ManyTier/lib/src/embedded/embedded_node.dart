@@ -19,7 +19,8 @@ enum EmbeddedNodeActionKind {
   networkConfigRequested(6),
   userMessageReceived(7),
   remoteTraceReceived(8),
-  pathNegotiationReceived(9);
+  pathNegotiationReceived(9),
+  destinationUnknown(10);
 
   const EmbeddedNodeActionKind(this.ffiCode);
 

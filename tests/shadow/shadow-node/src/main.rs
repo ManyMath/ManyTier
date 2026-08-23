@@ -1278,6 +1278,13 @@ async fn execute_actions(transport: &zerotier_service::NativeTransport, actions:
                     "REMOTE_TRACE received"
                 );
             }
+            NodeAction::DestinationUnknown { network_id } => {
+                tracing::debug!(
+                    network_id = %format!("{network_id:016x}"),
+                    event = "destination_unknown_action",
+                    "outbound packet for an address not in the member directory; config refresh requested"
+                );
+            }
             NodeAction::PathNegotiationReceived { origin, utility } => {
                 tracing::debug!(
                     origin = %format!("{:02x}{:02x}{:02x}{:02x}{:02x}",
