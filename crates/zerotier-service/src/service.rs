@@ -3,7 +3,7 @@
 //! This is the main entry point for `manytier service`. It starts the Node
 //! engine, optionally a controller, and the REST API server.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -213,6 +213,16 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
     // TUN devices per network, created lazily on NetworkConfigured.
     // Arc-wrapped so read tasks can share the device with the main loop.
     let mut tun_devices: HashMap<u64, Arc<NativeTun>> = HashMap::new();
+    // Outbound packets waiting for a peer path (see `PendingFrame`).
+    let mut pending_frames: VecDeque<PendingFrame> = VecDeque::new();
+    let mut pending_retry_interval =
+        tokio::time::interval(std::time::Duration::from_millis(PENDING_FRAME_RETRY_MS));
+    pending_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pending_whois_ms: u64 = 0;
+    // Flush due config requests between ticks.
+    let mut config_request_interval =
+        tokio::time::interval(std::time::Duration::from_millis(CONFIG_REQUEST_FLUSH_MS));
+    config_request_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Channel for TUN reads: avoids borrow checker issues with select!
     let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(64);
@@ -358,6 +368,60 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
                 );
                 execute_actions(&transport, &actions, udp_dump_dir.as_deref(), now).await;
                 execute_actions(&transport, &whois_actions, udp_dump_dir.as_deref(), now).await;
+
+                // No path yet: hold the packet.
+                if send_count == 0
+                    && local_reply_count == 0
+                    && actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            NodeAction::WhoisNeeded { .. } | NodeAction::DestinationUnknown { .. }
+                        )
+                    })
+                {
+                    queue_pending_frame(
+                        &mut pending_frames,
+                        PendingFrame {
+                            network_id,
+                            ethertype,
+                            frame,
+                            queued_at_ms: now,
+                        },
+                    );
+                    last_pending_whois_ms = now;
+                }
+            }
+
+            // Send NETWORK_CONFIG_REQUESTs that became due between ticks
+            _ = config_request_interval.tick() => {
+                let now = clock.now_wall_ms();
+                let (actions, whois_actions) = {
+                    let mut node_guard = node.lock().await;
+                    let actions = node_guard.flush_config_requests(now);
+                    let whois_actions = drain_whois_actions(&mut node_guard, &actions, now);
+                    (actions, whois_actions)
+                };
+                execute_actions(&transport, &actions, udp_dump_dir.as_deref(), now).await;
+                execute_actions(&transport, &whois_actions, udp_dump_dir.as_deref(), now).await;
+            }
+
+            // Retry outbound packets that were waiting for a peer path
+            _ = pending_retry_interval.tick(), if !pending_frames.is_empty() => {
+                let now = clock.now_wall_ms();
+                let send_whois =
+                    now.saturating_sub(last_pending_whois_ms) >= PENDING_FRAME_WHOIS_INTERVAL_MS;
+                if send_whois {
+                    last_pending_whois_ms = now;
+                }
+                retry_pending_frames(
+                    &node,
+                    &transport,
+                    udp_dump_dir.as_deref(),
+                    &mut pending_frames,
+                    now,
+                    send_whois,
+                )
+                .await;
             }
 
             // Graceful shutdown
@@ -744,6 +808,101 @@ async fn handle_controller_actions(
     }
 }
 
+/// How often due NETWORK_CONFIG_REQUESTs are flushed between ticks.
+const CONFIG_REQUEST_FLUSH_MS: u64 = 500;
+/// How long an outbound packet is held while waiting for a path to its peer.
+const PENDING_FRAME_TTL_MS: u64 = 5_000;
+/// How often held packets are retried.
+const PENDING_FRAME_RETRY_MS: u64 = 250;
+/// Minimum spacing between WHOIS re-sends triggered by held packets.
+const PENDING_FRAME_WHOIS_INTERVAL_MS: u64 = 1_000;
+/// Upper bound on held packets; the oldest is dropped beyond it.
+const PENDING_FRAME_LIMIT: usize = 64;
+
+/// Outbound packet held until a path to its peer exists (ZeroTier One's
+/// transmit queue).
+struct PendingFrame {
+    network_id: u64,
+    ethertype: u16,
+    frame: Vec<u8>,
+    queued_at_ms: u64,
+}
+
+fn queue_pending_frame(pending: &mut VecDeque<PendingFrame>, frame: PendingFrame) {
+    if pending.len() >= PENDING_FRAME_LIMIT {
+        pending.pop_front();
+    }
+    tracing::info!(
+        network_id = %format!("{:016x}", frame.network_id),
+        payload_len = frame.frame.len(),
+        queued = pending.len() + 1,
+        event = "tun_packet_queued",
+        "holding outbound packet until a path to the peer exists"
+    );
+    pending.push_back(frame);
+}
+
+/// Retry held packets; drop expired ones.
+async fn retry_pending_frames(
+    node: &Arc<Mutex<Node>>,
+    transport: &NativeTransport,
+    udp_dump_dir: Option<&Path>,
+    pending: &mut VecDeque<PendingFrame>,
+    now: u64,
+    send_whois: bool,
+) {
+    let mut sends = Vec::new();
+    let mut whois_needed = Vec::new();
+    let mut kept = VecDeque::new();
+    let whois_actions = {
+        let mut node_guard = node.lock().await;
+        let our_addr = *node_guard.identity.address.as_bytes();
+        while let Some(held) = pending.pop_front() {
+            if now.saturating_sub(held.queued_at_ms) > PENDING_FRAME_TTL_MS {
+                tracing::info!(
+                    network_id = %format!("{:016x}", held.network_id),
+                    payload_len = held.frame.len(),
+                    event = "tun_packet_expired",
+                    "dropping held outbound packet: no path to the peer within the hold time"
+                );
+                continue;
+            }
+            let actions = zerotier_node::vl2::process_outbound_frame(
+                &mut node_guard,
+                held.network_id,
+                held.ethertype,
+                &held.frame,
+                &our_addr,
+                now,
+            );
+            if actions
+                .iter()
+                .any(|action| matches!(action, NodeAction::SendTo { .. }))
+            {
+                tracing::info!(
+                    network_id = %format!("{:016x}", held.network_id),
+                    payload_len = held.frame.len(),
+                    held_ms = now.saturating_sub(held.queued_at_ms),
+                    event = "tun_packet_flushed",
+                    "sent held outbound packet now that a path to the peer exists"
+                );
+                sends.extend(actions);
+            } else {
+                whois_needed.extend(actions);
+                kept.push_back(held);
+            }
+        }
+        if send_whois {
+            drain_whois_actions(&mut node_guard, &whois_needed, now)
+        } else {
+            Vec::new()
+        }
+    };
+    *pending = kept;
+    execute_actions(transport, &sends, udp_dump_dir, now).await;
+    execute_actions(transport, &whois_actions, udp_dump_dir, now).await;
+}
+
 /// Handle TUN-related actions: write frames, create devices on config.
 ///
 /// When a new TUN device is created, spawns a read task that sends frames
@@ -1124,6 +1283,29 @@ mod tests {
         let mut buf = [0u8; 32];
         let written = address.serialize(&mut buf);
         buf[..written].to_vec()
+    }
+
+    #[test]
+    fn pending_frame_queue_drops_oldest_beyond_limit() {
+        use super::{queue_pending_frame, PendingFrame, PENDING_FRAME_LIMIT};
+        let mut pending = std::collections::VecDeque::new();
+        for i in 0..(PENDING_FRAME_LIMIT + 3) {
+            queue_pending_frame(
+                &mut pending,
+                PendingFrame {
+                    network_id: 1,
+                    ethertype: 0x0800,
+                    frame: vec![i as u8],
+                    queued_at_ms: i as u64,
+                },
+            );
+        }
+        assert_eq!(pending.len(), PENDING_FRAME_LIMIT);
+        assert_eq!(pending.front().map(|f| f.queued_at_ms), Some(3));
+        assert_eq!(
+            pending.back().map(|f| f.queued_at_ms),
+            Some((PENDING_FRAME_LIMIT + 2) as u64)
+        );
     }
 
     #[test]
