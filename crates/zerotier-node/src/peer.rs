@@ -117,6 +117,8 @@ pub struct Peer {
     pub state: PeerState,
     pub paths: Vec<Path>,
     pub is_root: bool,
+    /// Last PUSH_DIRECT_PATHS to this peer.
+    pub last_direct_path_push: u64,
 }
 
 impl Peer {
@@ -127,6 +129,7 @@ impl Peer {
             state: PeerState::Unknown,
             paths: Vec::new(),
             is_root,
+            last_direct_path_push: 0,
         }
     }
 

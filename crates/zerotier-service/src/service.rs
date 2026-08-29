@@ -328,6 +328,10 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
             _ = tick_interval.tick() => {
                 let now = clock.now_wall_ms();
                 let mut node_guard = node.lock().await;
+                // Refresh advertised endpoints.
+                node_guard.set_local_addresses(crate::platform::netif::local_udp_endpoints(
+                    config.udp_port,
+                ));
                 let actions = node_guard.tick(now);
                 let whois_actions = drain_whois_actions(&mut node_guard, &actions, now);
                 drop(node_guard);

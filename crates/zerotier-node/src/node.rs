@@ -169,8 +169,13 @@ const ZT_PENDING_ENCRYPTED_PACKET_TTL_MS: u64 = 30_000;
 const ZT_MAX_NETWORK_CONFIG_SIZE: usize = 1_048_576;
 
 /// The main ZeroTier VL1 node engine.
+/// Upper bound on local endpoints advertised or probed per peer.
+const MAX_LOCAL_ADDRESSES: usize = 8;
+
 pub struct Node {
     pub identity: Identity,
+    /// Local UDP endpoints pushed to network peers (PUSH_DIRECT_PATHS).
+    pub local_addresses: Vec<SocketAddr>,
     /// Peer table and root tracking.
     pub topology: Topology,
     /// Root server communication.
@@ -204,6 +209,7 @@ impl Node {
         Ok(Node {
             root_manager: RootManager::new(),
             identity,
+            local_addresses: Vec::new(),
             topology,
             reassembly: ReassemblyBuffer::new(256),
             actions: Vec::new(),
@@ -593,6 +599,140 @@ impl Node {
         PacketHeader::from_bytes(data)
             .map(|header| header.hops() == 0)
             .unwrap_or(false)
+    }
+
+    /// Caller filters loopback, link-local and tunnel addresses.
+    pub fn set_local_addresses(&mut self, mut addresses: Vec<SocketAddr>) {
+        addresses.sort();
+        addresses.dedup();
+        addresses.truncate(MAX_LOCAL_ADDRESSES);
+        self.local_addresses = addresses;
+    }
+
+    /// HELLO `target`; the path is recorded when OK(HELLO) arrives from it.
+    fn send_probe_hello(
+        &mut self,
+        peer_address: &[u8; 5],
+        target: SocketAddr,
+        now_ms: u64,
+        reason: &'static str,
+    ) {
+        if self.identity.secret.is_none() {
+            return;
+        }
+        let hello_secret = self
+            .shared_secret_for_peer(peer_address)
+            .unwrap_or([0u8; 48]);
+        let planet_id = self
+            .topology
+            .planet
+            .as_ref()
+            .map(|p| p.id)
+            .unwrap_or(zerotier_protocol::constants::WORLD_ID_EARTH);
+        let planet_ts = self
+            .topology
+            .planet
+            .as_ref()
+            .map(|p| p.timestamp)
+            .unwrap_or(0);
+        let mut buf = [0u8; 512];
+        if let Ok((len, _)) = RootManager::build_hello(
+            &self.identity,
+            peer_address,
+            target,
+            now_ms,
+            &hello_secret,
+            &mut buf,
+            planet_id,
+            planet_ts,
+        ) {
+            tracing::info!(
+                target: "manytier",
+                event = "hello_sent",
+                peer = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    peer_address[0], peer_address[1], peer_address[2],
+                    peer_address[3], peer_address[4]),
+                endpoint = %target,
+                "{}",
+                reason
+            );
+            self.actions.push(NodeAction::SendTo {
+                data: buf[..len].to_vec(),
+                address: target,
+            });
+        }
+    }
+
+    /// PUSH_DIRECT_PATHS to active network peers.
+    fn push_direct_paths(&mut self, now_ms: u64) {
+        if self.local_addresses.is_empty() {
+            return;
+        }
+        let members: BTreeSet<[u8; 5]> = self
+            .networks
+            .iter()
+            .flat_map(|net| net.members.iter().map(|member| member.zt_address))
+            .collect();
+        let targets: Vec<([u8; 5], SocketAddr)> = self
+            .topology
+            .peers
+            .iter()
+            .filter(|(addr, peer)| {
+                !peer.is_root
+                    && members.contains(*addr)
+                    && matches!(peer.state, PeerState::Active { .. })
+                    && (peer.last_direct_path_push == 0
+                        || now_ms.saturating_sub(peer.last_direct_path_push)
+                            >= ZT_DIRECT_PATH_PUSH_INTERVAL)
+            })
+            .filter_map(|(addr, peer)| peer.best_path(now_ms).map(|path| (*addr, path.address)))
+            .collect();
+
+        for (addr, phys_addr) in targets {
+            let Some(shared_secret) = self.shared_secret_for_peer(&addr) else {
+                continue;
+            };
+            let payload = zerotier_protocol::verbs::push_direct::PushDirectPathsPayload {
+                paths: self
+                    .local_addresses
+                    .iter()
+                    .map(
+                        |endpoint| zerotier_protocol::verbs::push_direct::DirectPath {
+                            flags: 0,
+                            address: InetAddress::from_socket_addr(*endpoint),
+                        },
+                    )
+                    .collect(),
+            };
+            let mut buf = [0u8; 512];
+            let len = payload.serialize(&mut buf);
+            let packet_id = self.allocate_packet_id();
+            let our_address = *self.identity.address.as_bytes();
+            if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
+                packet_id,
+                &our_address,
+                &addr,
+                Verb::PushDirectPaths,
+                &buf[..len],
+                &shared_secret,
+            ) {
+                tracing::info!(
+                    target: "manytier",
+                    event = "push_direct_paths_sent",
+                    peer = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        addr[0], addr[1], addr[2], addr[3], addr[4]),
+                    num_paths = self.local_addresses.len(),
+                    "sent PUSH_DIRECT_PATHS"
+                );
+                self.actions.push(NodeAction::SendTo {
+                    data: packet,
+                    address: phys_addr,
+                });
+                if let Some(peer) = self.topology.get_peer_mut(&addr) {
+                    peer.last_direct_path_push = now_ms;
+                }
+            }
+        }
     }
 
     /// Identity already validated for this address?
@@ -1106,8 +1246,7 @@ impl Node {
         // (WHOIS answers, COM address binding, etc.) that a valid MAC alone
         // does not establish. Validation is memory-hard, so as in ZeroTier One
         // it runs only for an identity not already held for that address.
-        if !self.identity_already_validated(&hello.identity) && !hello.identity.validate_address()
-        {
+        if !self.identity_already_validated(&hello.identity) && !hello.identity.validate_address() {
             tracing::debug!(
                 target: "manytier",
                 event = "hello_address_validation_failed",
@@ -1472,15 +1611,23 @@ impl Node {
             "PUSH_DIRECT_PATHS received"
         );
 
-        // Update peer paths
-        if let Some(peer) = self.topology.get_peer_mut(&source) {
-            for path in push.paths {
-                if let Some(addr) = path.address.to_socket_addr() {
-                    peer.add_path(addr, true, now_ms);
-                }
-            }
-            // Also add the path we received this from
-            peer.add_path(from, Self::arrived_directly(data), now_ms);
+        // Probe pushed endpoints with HELLO; a path is recorded only when the
+        // peer answers on it.
+        let direct = Self::arrived_directly(data);
+        let Some(peer) = self.topology.get_peer_mut(&source) else {
+            return;
+        };
+        peer.add_path(from, direct, now_ms);
+        let known: Vec<SocketAddr> = peer.paths.iter().map(|path| path.address).collect();
+        let probes: Vec<SocketAddr> = push
+            .paths
+            .into_iter()
+            .filter_map(|path| path.address.to_socket_addr())
+            .filter(|addr| *addr != from && !known.contains(addr))
+            .take(MAX_LOCAL_ADDRESSES)
+            .collect();
+        for target in probes {
+            self.send_probe_hello(&source, target, now_ms, "probing pushed direct path");
         }
     }
 
@@ -2267,6 +2414,9 @@ impl Node {
                 }
             }
         }
+
+        // 4b. Advertise our local endpoints to network peers.
+        self.push_direct_paths(now_ms);
 
         // 5. Reconnect stale peers with exponential HELLO backoff.
         for (addr, phys_addr) in &reconnect_targets {
@@ -4606,6 +4756,103 @@ mod tests {
         node.receive_packet(&mut data, from, 5000);
         let peer = node.topology.get_peer(&client_addr).unwrap();
         assert!(matches!(peer.state, PeerState::Active { .. }));
+    }
+
+    #[test]
+    fn tick_pushes_local_endpoints_to_active_network_peers() {
+        let mut rng = XorShift17_11(0x5051);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let peer_socket: SocketAddr = "203.0.113.7:9993".parse().unwrap();
+        let shared_secret = [0x11; 48];
+        let peer_addr = add_active_peer(&mut node, test_identity(0x71), peer_socket, shared_secret);
+        let network_id = 0xa0b1_c2d3_e400_0001_u64;
+        node.join_network(make_membership_with_peer(network_id, our_addr, peer_addr));
+        node.set_local_addresses(vec![
+            "192.168.1.218:9993".parse().unwrap(),
+            "192.168.1.218:9993".parse().unwrap(),
+        ]);
+        assert_eq!(node.local_addresses.len(), 1, "duplicates are collapsed");
+
+        let is_push = |action: &NodeAction| match action {
+            NodeAction::SendTo { data, address } if *address == peer_socket => {
+                let mut packet = data.clone();
+                salsa::dearmor_packet(&shared_secret, &mut packet).is_ok()
+                    && Verb::from_byte(packet[27] & 0x1f) == Some(Verb::PushDirectPaths)
+            }
+            _ => false,
+        };
+        let actions = node.tick(2_000);
+        assert!(
+            actions.iter().any(is_push),
+            "expected a PUSH_DIRECT_PATHS to the network peer, got {actions:?}"
+        );
+        assert_eq!(
+            node.topology
+                .get_peer(&peer_addr)
+                .unwrap()
+                .last_direct_path_push,
+            2_000
+        );
+
+        // Not repeated before the push interval elapses.
+        let again = node.tick(2_000 + ZT_DIRECT_PATH_PUSH_INTERVAL / 2);
+        assert!(!again.iter().any(is_push), "push must be rate limited");
+    }
+
+    #[test]
+    fn pushed_direct_paths_are_probed_with_hello_not_trusted() {
+        let mut rng = XorShift17_11(0x5052);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let relay_socket: SocketAddr = "203.0.113.7:9993".parse().unwrap();
+        let shared_secret = [0x11; 48];
+        let peer_addr =
+            add_active_peer(&mut node, test_identity(0x72), relay_socket, shared_secret);
+
+        let lan: SocketAddr = "192.168.1.50:9993".parse().unwrap();
+        let payload = zerotier_protocol::verbs::push_direct::PushDirectPathsPayload {
+            paths: vec![zerotier_protocol::verbs::push_direct::DirectPath {
+                flags: 0,
+                address: InetAddress::from_socket_addr(lan),
+            }],
+        };
+        let mut buf = [0u8; 128];
+        let len = payload.serialize(&mut buf);
+        let mut packet = crate::vl2::build_encrypted_verb_packet(
+            0x0102_0304_0506_0708,
+            &peer_addr,
+            &our_addr,
+            Verb::PushDirectPaths,
+            &buf[..len],
+            &shared_secret,
+        )
+        .unwrap();
+
+        let actions = node.receive_packet(&mut packet, relay_socket, 5_000);
+        let probed = actions.iter().any(|action| {
+            matches!(
+                action,
+                NodeAction::SendTo { data, address }
+                    if *address == lan && Verb::from_byte(data[27] & 0x1f) == Some(Verb::Hello)
+            )
+        });
+        assert!(
+            probed,
+            "pushed endpoint must be probed with a HELLO, got {actions:?}"
+        );
+        let peer = node.topology.get_peer(&peer_addr).unwrap();
+        assert!(
+            !peer.paths.iter().any(|path| path.address == lan),
+            "a pushed endpoint must not become a path before the peer answers on it"
+        );
+        assert!(peer.paths.iter().any(|path| path.address == relay_socket));
     }
 
     #[test]
