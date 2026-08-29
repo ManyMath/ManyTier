@@ -57,13 +57,76 @@ fn collect_keys(dir: &Path, root: &Path, keys: &mut Vec<String>) -> std::io::Res
     Ok(())
 }
 
+/// Keys holding secrets (`identity.secret`, `authtoken.secret`, ...) are
+/// written owner-read/write only, as official ZeroTier does: the auth token
+/// grants full control of the node's API and the identity secret is the node.
+fn is_secret_key(key: &str) -> bool {
+    key.ends_with(".secret")
+}
+
+#[cfg(unix)]
+async fn write_private(path: &Path, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    // `mode` only applies when the file is created; an existing world-readable
+    // file keeps its bits, so tighten them explicitly.
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    file.write_all(value).await?;
+    file.flush().await
+}
+
+#[cfg(not(unix))]
+async fn write_private(path: &Path, value: &[u8]) -> std::io::Result<()> {
+    fs::write(path, value).await
+}
+
+/// Fix up a secret file left readable by others by an earlier version.
+#[cfg(unix)]
+async fn tighten_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = fs::metadata(path).await else {
+        return;
+    };
+    if metadata.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    match fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            "tightened permissions of secret file to 0600"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "secret file is readable by other users and could not be tightened"
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+async fn tighten_private(_path: &Path) {}
+
 impl Storage for NativeStorage {
     type Error = std::io::Error;
 
     async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
         let path = self.resolve(key)?;
-        match fs::read(path).await {
-            Ok(bytes) => Ok(Some(bytes)),
+        match fs::read(&path).await {
+            Ok(bytes) => {
+                if is_secret_key(key) {
+                    tighten_private(&path).await;
+                }
+                Ok(Some(bytes))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -74,7 +137,11 @@ impl Storage for NativeStorage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(path, value).await
+        if is_secret_key(key) {
+            write_private(&path, value).await
+        } else {
+            fs::write(path, value).await
+        }
     }
 
     async fn delete(&self, key: &str) -> Result<(), Self::Error> {
@@ -147,6 +214,66 @@ mod tests {
 
         let error = storage.store("../escape", b"nope").await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secret_keys_are_written_owner_only_and_tightened_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("secrets");
+        let storage = NativeStorage::new(&dir).unwrap();
+
+        storage.store("authtoken.secret", b"token").await.unwrap();
+        let mode = std::fs::metadata(dir.join("authtoken.secret"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "fresh secret must be 0600, got {mode:o}"
+        );
+
+        // A world-readable file from an older version is tightened on load
+        // and on overwrite.
+        let stale = dir.join("identity.secret");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            storage.load("identity.secret").await.unwrap(),
+            Some(b"old".to_vec())
+        );
+        let mode = std::fs::metadata(&stale).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "loaded secret must be tightened, got {mode:o}"
+        );
+
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        storage.store("identity.secret", b"new").await.unwrap();
+        let mode = std::fs::metadata(&stale).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "overwritten secret must be 0600, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&stale).unwrap(), b"new");
+
+        // Non-secret files keep the default mode.
+        storage.store("identity.public", b"pub").await.unwrap();
+        let mode = std::fs::metadata(dir.join("identity.public"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o044,
+            0,
+            "public file should stay readable, got {mode:o}"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

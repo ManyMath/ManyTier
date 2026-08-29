@@ -142,6 +142,20 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
         );
     }
 
+    // 3.6 Re-join the networks remembered in {data-dir}/networks.d/ so a
+    // restart keeps every membership (the join handler writes the marker,
+    // the leave handler removes it). Configs are requested afresh.
+    for network_id in api::network::remembered_networks(&config.data_dir) {
+        node.join_network(zerotier_node::network::NetworkMembership::new(
+            network_id,
+            api::network::DEFAULT_NETWORK_MTU,
+        ));
+        tracing::info!(
+            network_id = %format!("{:016x}", network_id),
+            "re-joined remembered network from networks.d"
+        );
+    }
+
     let node = Arc::new(Mutex::new(node));
 
     // 4. Generate or load authtoken.secret

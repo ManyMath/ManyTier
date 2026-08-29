@@ -103,9 +103,7 @@ pub async fn join_network(
     let our_addr = *node.identity.address.as_bytes();
 
     if let Some(existing) = node.find_network_mut(network_id) {
-        existing.our_com = None;
-        existing.peer_coms.clear();
-        existing.members.clear();
+        // Re-request the config; keep certificates and members until it lands.
         existing.pending_config_request = true;
         existing.last_config_request = 0;
         let device = port_device_name(&state, network_id);
@@ -113,8 +111,10 @@ pub async fn join_network(
     }
 
     // Create empty membership -- config will come from controller
-    let membership = zerotier_node::network::NetworkMembership::new(network_id, 2800);
+    let membership =
+        zerotier_node::network::NetworkMembership::new(network_id, DEFAULT_NETWORK_MTU);
     node.join_network(membership);
+    remember_network(&state.data_dir, network_id);
 
     let mac = zerotier_node::ethernet::derive_mac(&our_addr, network_id);
 
@@ -137,5 +137,194 @@ pub async fn leave_network(
     let network_id = u64::from_str_radix(&id, 16).map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut node = state.node.lock().await;
     node.networks.retain(|n| n.network_id != network_id);
+    forget_network(&state.data_dir, network_id);
     Ok(StatusCode::OK)
+}
+
+/// MTU used for a membership until the controller's config replaces it.
+pub const DEFAULT_NETWORK_MTU: u16 = 2800;
+
+/// Directory of join markers, one empty `<network-id>.conf` per joined
+/// network, the same layout official ZeroTier keeps so a restart re-joins
+/// everything the node was on. The file contents are not read.
+fn networks_dir(data_dir: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(data_dir).join("networks.d")
+}
+
+fn network_marker_path(data_dir: &str, network_id: u64) -> std::path::PathBuf {
+    networks_dir(data_dir).join(format!("{:016x}.conf", network_id))
+}
+
+/// Record `network_id` in `networks.d` so the service re-joins it after a
+/// restart. Failure is logged, not returned: the in-memory join succeeded and
+/// the node keeps working until the next restart.
+fn remember_network(data_dir: &str, network_id: u64) {
+    let dir = networks_dir(data_dir);
+    let path = network_marker_path(data_dir, network_id);
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, b"")) {
+        tracing::warn!(
+            network_id = %format!("{:016x}", network_id),
+            path = %path.display(),
+            error = %error,
+            "could not remember joined network; it will not be re-joined after a restart"
+        );
+    }
+}
+
+fn forget_network(data_dir: &str, network_id: u64) {
+    let path = network_marker_path(data_dir, network_id);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            network_id = %format!("{:016x}", network_id),
+            path = %path.display(),
+            error = %error,
+            "could not remove join marker; the network will be re-joined after a restart"
+        ),
+    }
+}
+
+/// Network IDs remembered in `networks.d`, sorted, ignoring files that are
+/// not `<16 hex digits>.conf`.
+pub fn remembered_networks(data_dir: &str) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(networks_dir(data_dir)) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".conf")?;
+            if stem.len() != 16 {
+                return None;
+            }
+            u64::from_str_radix(stem, 16).ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+    use zerotier_crypto::identity::{Address, Identity, PublicKey};
+    use zerotier_node::network::NetworkMember;
+    use zerotier_node::node::Node;
+    use zerotier_protocol::world::DEFAULT_PLANET;
+
+    fn test_identity() -> Identity {
+        let address = Address::new([0xa0, 0xb1, 0xc2, 0xd3, 0x11]).unwrap();
+        let mut pk_bytes = [0u8; 64];
+        for (i, b) in pk_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x11);
+        }
+        Identity {
+            address,
+            public_key: PublicKey::from_bytes(&pk_bytes).unwrap(),
+            secret: None,
+        }
+    }
+
+    fn app_state() -> Arc<AppState> {
+        let node = Node::new(test_identity(), DEFAULT_PLANET, 1).expect("node");
+        // Join writes networks.d markers under data_dir.
+        let data_dir = std::env::temp_dir().join(format!(
+            "manytier-network-api-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        Arc::new(AppState {
+            node: Arc::new(Mutex::new(node)),
+            auth_token: "test-token".to_string(),
+            controller: None,
+            data_dir: data_dir.to_string_lossy().to_string(),
+            tun_names: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn rejoining_requests_fresh_config_without_dropping_membership_state() {
+        const NETWORK_ID: u64 = 0xa0b1c2d3e4000001;
+        let state = app_state();
+        let id = format!("{NETWORK_ID:016x}");
+
+        let first = join_network(State(Arc::clone(&state)), Path(id.clone()))
+            .await
+            .expect("first join");
+        assert_eq!(first.0.status, "REQUESTING_CONFIGURATION");
+        {
+            let mut node = state.node.lock().await;
+            let net = node.find_network_mut(NETWORK_ID).expect("joined network");
+            net.members.push(NetworkMember {
+                zt_address: [1, 2, 3, 4, 5],
+                mac: [0; 6],
+                ipv4: None,
+                ipv6: None,
+                authorized: true,
+            });
+            net.pending_config_request = false;
+            net.last_config_request = 42;
+        }
+
+        let rejoined = join_network(State(Arc::clone(&state)), Path(id))
+            .await
+            .expect("rejoin");
+        assert_eq!(rejoined.0.id, format!("{NETWORK_ID:016x}"));
+
+        let node = state.node.lock().await;
+        let net = node.find_network(NETWORK_ID).expect("network still joined");
+        assert_eq!(
+            net.members.len(),
+            1,
+            "re-joining must keep the member directory until the new config lands"
+        );
+        assert!(
+            net.pending_config_request,
+            "re-joining must request a fresh config"
+        );
+        assert_eq!(
+            net.last_config_request, 0,
+            "the request must not be rate limited"
+        );
+    }
+
+    #[test]
+    fn join_markers_round_trip_through_networks_d() {
+        let dir = std::env::temp_dir().join(format!(
+            "manytier-networks-d-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = dir.to_str().unwrap().to_string();
+        assert!(remembered_networks(&data_dir).is_empty());
+
+        remember_network(&data_dir, 0x2105b78c5f78ff8e);
+        remember_network(&data_dir, 0x1111111111111111);
+        remember_network(&data_dir, 0x2105b78c5f78ff8e);
+        std::fs::write(dir.join("networks.d").join("junk.txt"), b"x").unwrap();
+        std::fs::write(dir.join("networks.d").join("abc.conf"), b"x").unwrap();
+        assert_eq!(
+            remembered_networks(&data_dir),
+            vec![0x1111111111111111, 0x2105b78c5f78ff8e]
+        );
+
+        forget_network(&data_dir, 0x1111111111111111);
+        forget_network(&data_dir, 0x1111111111111111);
+        assert_eq!(remembered_networks(&data_dir), vec![0x2105b78c5f78ff8e]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
