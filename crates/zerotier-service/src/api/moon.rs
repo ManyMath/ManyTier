@@ -211,6 +211,7 @@ mod tests {
             auth_token: AUTH_TOKEN.to_string(),
             controller: None,
             data_dir: data_dir.path().to_string_lossy().to_string(),
+            tun_names: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

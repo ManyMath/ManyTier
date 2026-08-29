@@ -26,6 +26,8 @@ pub struct AppState {
         Option<Arc<Mutex<zerotier_node::controller::engine::Controller<SqliteStorage>>>>,
     /// Service data directory; the moon handlers read `{data_dir}/moons.d/`.
     pub data_dir: String,
+    /// Interface name per joined network (`portDeviceName`).
+    pub tun_names: Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
 }
 
 /// Build the axum router with all service API routes and auth middleware.

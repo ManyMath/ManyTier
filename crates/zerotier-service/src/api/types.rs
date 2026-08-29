@@ -49,6 +49,9 @@ pub struct NetworkResponse {
     pub assigned_addresses: Vec<String>,
     pub mac: String,
     pub mtu: u16,
+    /// TUN interface name; empty until created.
+    #[serde(rename = "portDeviceName")]
+    pub port_device_name: String,
 }
 
 // --- Controller API types (Plan 05) ---

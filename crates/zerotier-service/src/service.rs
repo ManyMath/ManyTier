@@ -179,11 +179,15 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
     tracing::info!(udp_bind = %bind_addr, "UDP transport bound");
 
     // 7. Start API server in background task
+    // Interface name per network, reported as `portDeviceName`.
+    let tun_names: Arc<std::sync::Mutex<HashMap<u64, String>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(api::AppState {
         node: node.clone(),
         auth_token,
         controller: controller.clone(),
         data_dir: config.data_dir.clone(),
+        tun_names: Arc::clone(&tun_names),
     });
     let router = api::build_router(state);
     let api_bind_addr = format!("127.0.0.1:{}", config.api_port);
@@ -295,9 +299,9 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
                         execute_actions(&transport, &pending, udp_dump_dir.as_deref(), now).await;
                         execute_actions(&transport, &whois_actions, udp_dump_dir.as_deref(), now)
                             .await;
-                        handle_tun_actions(&actions, &mut tun_devices, &tun_tx, local_zt_address)
+                        handle_tun_actions(&actions, &mut tun_devices, &tun_tx, local_zt_address, &tun_names)
                             .await;
-                        handle_tun_actions(&pending, &mut tun_devices, &tun_tx, local_zt_address)
+                        handle_tun_actions(&pending, &mut tun_devices, &tun_tx, local_zt_address, &tun_names)
                             .await;
                     }
                     Err(e) => {
@@ -315,7 +319,7 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
                 drop(node_guard);
                 execute_actions(&transport, &actions, udp_dump_dir.as_deref(), now).await;
                 execute_actions(&transport, &whois_actions, udp_dump_dir.as_deref(), now).await;
-                handle_tun_actions(&actions, &mut tun_devices, &tun_tx, local_zt_address).await;
+                handle_tun_actions(&actions, &mut tun_devices, &tun_tx, local_zt_address, &tun_names).await;
             }
 
             // TUN device read (outbound VL2 traffic)
@@ -912,6 +916,7 @@ async fn handle_tun_actions(
     tun_devices: &mut HashMap<u64, Arc<NativeTun>>,
     tun_tx: &tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
     local_zt_address: [u8; 5],
+    tun_names: &std::sync::Mutex<HashMap<u64, String>>,
 ) {
     for action in actions {
         match action {
@@ -972,6 +977,9 @@ async fn handle_tun_actions(
                             configure_tun_from_dict_data(&tun, *network_id, dict_data).await;
                             let tun = Arc::new(tun);
                             tun_devices.insert(*network_id, Arc::clone(&tun));
+                            if let Ok(mut names) = tun_names.lock() {
+                                names.insert(*network_id, tun.name().to_string());
+                            }
 
                             // Spawn a read task for this TUN device
                             let nwid = *network_id;

@@ -21,6 +21,7 @@ fn format_mac(mac: &[u8; 6]) -> String {
 fn membership_to_response(
     net: &zerotier_node::network::NetworkMembership,
     our_addr: &[u8; 5],
+    port_device_name: String,
 ) -> NetworkResponse {
     // Collect assigned addresses from members matching our address.
     // Dynamic controller-delivered assignments are tracked directly on the
@@ -61,7 +62,18 @@ fn membership_to_response(
         assigned_addresses: assigned,
         mac: format_mac(&mac),
         mtu: net.mtu,
+        port_device_name,
     }
+}
+
+/// The TUN interface name the service recorded for `network_id`, if any.
+fn port_device_name(state: &AppState, network_id: u64) -> String {
+    state
+        .tun_names
+        .lock()
+        .ok()
+        .and_then(|names| names.get(&network_id).cloned())
+        .unwrap_or_default()
 }
 
 /// List all joined networks.
@@ -72,7 +84,10 @@ pub async fn list_networks(State(state): State<Arc<AppState>>) -> Json<Vec<Netwo
     let networks: Vec<NetworkResponse> = node
         .networks
         .iter()
-        .map(|net| membership_to_response(net, our_addr))
+        .map(|net| {
+            let device = port_device_name(&state, net.network_id);
+            membership_to_response(net, our_addr, device)
+        })
         .collect();
 
     Json(networks)
@@ -93,7 +108,8 @@ pub async fn join_network(
         existing.members.clear();
         existing.pending_config_request = true;
         existing.last_config_request = 0;
-        return Ok(Json(membership_to_response(existing, &our_addr)));
+        let device = port_device_name(&state, network_id);
+        return Ok(Json(membership_to_response(existing, &our_addr, device)));
     }
 
     // Create empty membership -- config will come from controller
@@ -109,6 +125,7 @@ pub async fn join_network(
         assigned_addresses: vec![],
         mac: format_mac(&mac),
         mtu: 2800,
+        port_device_name: String::new(),
     }))
 }
 
