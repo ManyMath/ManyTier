@@ -137,7 +137,7 @@ pub const ZT_MIN_UNITE_INTERVAL: u64 = 30_000;
 pub const ZT_PING_CHECK_INTERVAL: u64 = 5_000;
 
 /// Interval for pushing direct paths when no direct path exists.
-pub const ZT_DIRECT_PATH_PUSH_INTERVAL: u64 = 30_000;
+pub const ZT_DIRECT_PATH_PUSH_INTERVAL: u64 = 15_000;
 
 /// Interval for pushing direct paths when a direct path already exists.
 pub const ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH: u64 = 120_000;
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(ZT_PATH_HELLO_RATE_LIMIT, 1_000);
         assert_eq!(ZT_MIN_UNITE_INTERVAL, 30_000);
         assert_eq!(ZT_PING_CHECK_INTERVAL, 5_000);
-        assert_eq!(ZT_DIRECT_PATH_PUSH_INTERVAL, 30_000);
+        assert_eq!(ZT_DIRECT_PATH_PUSH_INTERVAL, 15_000);
         assert_eq!(ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH, 120_000);
     }
 

@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPath {
-    pub flags: u16,
+    /// Path record flags: 0x01 forget this path, 0x02 cluster redirect.
+    pub flags: u8,
     pub address: InetAddress,
 }
 
@@ -25,9 +26,9 @@ impl PushDirectPathsPayload {
         let mut offset = 2;
 
         for path in &self.paths {
-            // flags
-            buf[offset..offset + 2].copy_from_slice(&path.flags.to_be_bytes());
-            offset += 2;
+            // flags (one byte, see ZeroTierOne node/Packet.hpp VERB_PUSH_DIRECT_PATHS)
+            buf[offset] = path.flags;
+            offset += 1;
             // ext characteristics length = 0
             buf[offset..offset + 2].copy_from_slice(&0u16.to_be_bytes());
             offset += 2;
@@ -77,14 +78,14 @@ impl PushDirectPathsPayload {
         let mut paths = Vec::with_capacity(path_count);
 
         for _ in 0..path_count {
-            if offset + 4 > data.len() {
+            if offset + 3 > data.len() {
                 return Err(ProtocolError::TooShort {
-                    need: offset + 4,
+                    need: offset + 3,
                     got: data.len(),
                 });
             }
-            let flags = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            offset += 2;
+            let flags = data[offset];
+            offset += 1;
             let ext_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
             // skip ext characteristics data
@@ -143,14 +144,14 @@ mod tests {
         let payload = PushDirectPathsPayload {
             paths: vec![
                 DirectPath {
-                    flags: 0x0001,
+                    flags: 0x01,
                     address: InetAddress::V4 {
                         ip: [10, 0, 0, 1],
                         port: 9993,
                     },
                 },
                 DirectPath {
-                    flags: 0x0000,
+                    flags: 0x00,
                     address: InetAddress::V6 {
                         ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
                         port: 443,
@@ -162,6 +163,36 @@ mod tests {
         let n = payload.serialize(&mut buf);
         let parsed = PushDirectPathsPayload::deserialize(&buf[..n]).unwrap();
         assert_eq!(parsed, payload);
+    }
+
+    /// Record layout from ZeroTierOne node/Packet.hpp (VERB_PUSH_DIRECT_PATHS)
+    /// and node/Peer.cpp: `[1] flags, [2] ext len, [1] addr type, [1] addr len,
+    /// [...] addr`.
+    #[test]
+    fn push_direct_paths_matches_upstream_byte_layout() {
+        let upstream: [u8; 13] = [
+            0x00, 0x01, // one path
+            0x00, // flags
+            0x00, 0x00, // no extended characteristics
+            0x04, // IPv4
+            0x06, // 4 ip + 2 port
+            192, 168, 1, 50, // ip
+            0x27, 0x09, // port 9993
+        ];
+        let parsed = PushDirectPathsPayload::deserialize(&upstream).unwrap();
+        assert_eq!(parsed.paths.len(), 1);
+        assert_eq!(parsed.paths[0].flags, 0);
+        assert_eq!(
+            parsed.paths[0].address,
+            InetAddress::V4 {
+                ip: [192, 168, 1, 50],
+                port: 9993,
+            }
+        );
+
+        let mut buf = [0u8; 64];
+        let n = parsed.serialize(&mut buf);
+        assert_eq!(&buf[..n], &upstream[..]);
     }
 
     #[test]

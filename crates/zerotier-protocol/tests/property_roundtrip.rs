@@ -324,11 +324,11 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
         let push_direct = PushDirectPathsPayload {
             paths: vec![
                 DirectPath {
-                    flags: seed as u16,
+                    flags: seed as u8,
                     address: inet_address.clone(),
                 },
                 DirectPath {
-                    flags: (seed as u16).wrapping_add(1),
+                    flags: (seed as u8).wrapping_add(1),
                     address: inet_address_from_seed(seed + 1),
                 },
             ],
