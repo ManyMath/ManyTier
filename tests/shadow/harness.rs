@@ -36,6 +36,9 @@ const VALIDATION_FIXTURE_ROOT_ENV: &str = "MANYTIER_VALIDATION_FIXTURE_ROOT";
 const VALIDATION_SCRATCH_ROOT_ENV: &str = "MANYTIER_VALIDATION_SCRATCH_ROOT";
 const WORKSPACE_ROOT_ENV: &str = "MANYTIER_WORKSPACE_ROOT";
 const PRIVILEGED_LIVE_RUNNER: &str = "tests/shadow/run-privileged-live.sh";
+const MACOS_LIVE_RUNNER: &str = "tests/shadow/run-macos-live.sh";
+/// Identity generation is a memory-hard search; debug builds can exceed 30 s.
+const MANYTIER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[path = "pcap.rs"]
 mod pcap;
@@ -202,7 +205,7 @@ fn enforce_live_data_plane_lane(
             "LIVE LANE MISCONFIGURATION: {PRIVILEGED_LIVE_ENV}=1 selects the privileged live lane, \
              but this environment still cannot create/configure a real TUN/TAP device.\n\
              Use {PRIVILEGED_LIVE_RUNNER} only on a runner/VM/container with CAP_NET_ADMIN \
-             and /dev/net/tun wired through.\n\
+             and /dev/net/tun wired through, or {MACOS_LIVE_RUNNER} as root on macOS.\n\
              Failure category:\n{failure_category}"
         );
         assert!(data_plane_evidence, "{assertion_message}");
@@ -1432,15 +1435,18 @@ fn prepare_zerotier_home(home_dir: &Path, network_id: Option<u64>) {
 }
 
 fn host_tun_tap_available() -> bool {
-    let tun_path = Path::new("/dev/net/tun");
-    if !tun_path.exists()
-        || std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(tun_path)
-            .is_err()
-    {
-        return false;
+    // /dev/net/tun exists only on Linux; the probe below covers macOS.
+    if cfg!(target_os = "linux") {
+        let tun_path = Path::new("/dev/net/tun");
+        if !tun_path.exists()
+            || std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tun_path)
+                .is_err()
+        {
+            return false;
+        }
     }
 
     let probe_name = format!("mt{:05x}", std::process::id() & 0xFFFFF);
@@ -2291,6 +2297,48 @@ fn assigned_ipv4_via_manytier_api(
         .map(|value| value.split('/').next().unwrap_or(value).to_string())
 }
 
+/// Network status from GET /network.
+fn network_status_via_manytier_api(
+    api_port: u16,
+    authtoken: &str,
+    network_id: &str,
+) -> Option<String> {
+    let url = format!("http://127.0.0.1:{}/network", api_port);
+    let output = Command::new("curl")
+        .args(["-s", "-H", &format!("X-ZT1-Auth: {}", authtoken), &url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let networks: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
+    networks
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(network_id))?
+        .get("status")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn wait_for_network_status_ok_via_manytier_api(
+    api_port: u16,
+    authtoken: &str,
+    network_id: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if network_status_via_manytier_api(api_port, authtoken, network_id).as_deref() == Some("OK")
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
 fn wait_for_assigned_ipv4_via_manytier_api(
     api_port: u16,
     authtoken: &str,
@@ -2382,10 +2430,195 @@ fn fallback_tun_name(network_id: &str, node_addr: &[u8; 5]) -> Option<String> {
     ))
 }
 
+/// Linux names the interface deterministically; macOS assigns `utunN`, so
+/// look it up by address.
+fn fallback_interface_name(
+    network_id: &str,
+    node_addr: &[u8; 5],
+    assigned_ipv4: &str,
+) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return wait_for_interface_name_for_ipv4(assigned_ipv4, std::time::Duration::from_secs(5));
+    }
+    fallback_tun_name(network_id, node_addr)
+}
+
+struct InterfaceIcmpCapture {
+    child: Child,
+    pcap: PathBuf,
+    interface: String,
+}
+
+/// tcpdump evidence from both tunnel interfaces (macOS lane).
+struct RoutedPacketEvidence {
+    confirmed: bool,
+    sender_interface: String,
+    receiver_interface: String,
+    needle: String,
+    sender_capture: String,
+    receiver_capture: String,
+}
+
+impl RoutedPacketEvidence {
+    fn report(&self) -> String {
+        format!(
+            "Routed-packet capture (tcpdump on both tunnel interfaces):\n\
+             expected on receiver {}: `{}` -> {}\n\
+             --- sender {} ---\n{}\n--- receiver {} ---\n{}\n",
+            self.receiver_interface,
+            self.needle,
+            if self.confirmed { "FOUND" } else { "NOT FOUND" },
+            self.sender_interface,
+            self.sender_capture.trim_end(),
+            self.receiver_interface,
+            self.receiver_capture.trim_end(),
+        )
+    }
+}
+
+/// macOS only; other platforms return `None`.
+fn spawn_interface_icmp_capture(
+    dir: &Path,
+    label: &str,
+    interface: &str,
+) -> Option<InterfaceIcmpCapture> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let pcap = dir.join(format!("{label}-{interface}-icmp.pcap"));
+    match Command::new("tcpdump")
+        .args(["-i", interface, "-n", "-U", "--immediate-mode", "-w"])
+        .arg(&pcap)
+        .arg("icmp")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => Some(InterfaceIcmpCapture {
+            child,
+            pcap,
+            interface: interface.to_string(),
+        }),
+        Err(error) => {
+            eprintln!(
+                "[fallback-mt] tcpdump on {} could not start (macOS routed-packet capture skipped): {}",
+                interface, error
+            );
+            None
+        }
+    }
+}
+
+fn finish_interface_icmp_capture(capture: InterfaceIcmpCapture) -> String {
+    // SIGINT so tcpdump flushes.
+    let _ = Command::new("kill")
+        .args(["-INT", &capture.child.id().to_string()])
+        .status();
+    let stderr = match capture.child.wait_with_output() {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) => format!("<failed to wait for tcpdump: {}>", error),
+    };
+    let decoded = match Command::new("tcpdump")
+        .args(["-n", "-r"])
+        .arg(&capture.pcap)
+        .output()
+    {
+        Ok(output) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("<failed to decode {}: {}>", capture.pcap.display(), error),
+    };
+    format!(
+        "pcap: {}\ncapture stderr: {}\n{}",
+        capture.pcap.display(),
+        stderr,
+        decoded.trim_end()
+    )
+}
+
+fn finish_interface_icmp_captures(
+    sender: Option<InterfaceIcmpCapture>,
+    receiver: Option<InterfaceIcmpCapture>,
+    sender_ip: &str,
+    receiver_ip: &str,
+) -> Option<RoutedPacketEvidence> {
+    let (sender, receiver) = (sender?, receiver?);
+    // Relayed frames can take seconds to land.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    let sender_interface = sender.interface.clone();
+    let receiver_interface = receiver.interface.clone();
+    let sender_capture = finish_interface_icmp_capture(sender);
+    let receiver_capture = finish_interface_icmp_capture(receiver);
+    let needle = format!("IP {} > {}: ICMP echo request", sender_ip, receiver_ip);
+    let confirmed = receiver_capture.contains(&needle);
+    Some(RoutedPacketEvidence {
+        confirmed,
+        sender_interface,
+        receiver_interface,
+        needle,
+        sender_capture,
+        receiver_capture,
+    })
+}
+
+/// Linux binds with `-I`; macOS with `-b`, and its `-W` is in ms.
+fn ping_over_interface_args(interface: &str, dest_ip: &str) -> Vec<String> {
+    let args: &[&str] = if cfg!(target_os = "macos") {
+        &["-c", "3", "-W", "1000", "-i", "1", "-b", interface, dest_ip]
+    } else {
+        &["-c", "3", "-W", "1", "-i", "1", "-I", interface, dest_ip]
+    };
+    args.iter().map(|arg| arg.to_string()).collect()
+}
+
+#[cfg(test)]
+mod macos_lane_helper_tests {
+    use super::*;
+
+    #[test]
+    fn ifconfig_parser_finds_interface_by_inet_address() {
+        let output = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+\tinet 127.0.0.1 netmask 0xff000000\n\
+utun9: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 2800\n\
+\tinet 10.147.20.7 --> 10.147.20.7 netmask 0xffffff00\n\
+\tinet6 fe80::1%utun9 prefixlen 64\n";
+        assert_eq!(
+            interface_name_for_ipv4_in_ifconfig(output, "10.147.20.7").as_deref(),
+            Some("utun9")
+        );
+        assert_eq!(
+            interface_name_for_ipv4_in_ifconfig(output, "127.0.0.1").as_deref(),
+            Some("lo0")
+        );
+        assert_eq!(
+            interface_name_for_ipv4_in_ifconfig(output, "10.147.20.8"),
+            None
+        );
+    }
+
+    #[test]
+    fn ping_args_bind_to_the_interface_per_platform() {
+        let args = ping_over_interface_args("utun9", "10.147.20.9");
+        let bind_flag = if cfg!(target_os = "macos") {
+            "-b"
+        } else {
+            "-I"
+        };
+        let position = args
+            .iter()
+            .position(|arg| arg == bind_flag)
+            .expect("interface bind flag");
+        assert_eq!(args[position + 1], "utun9");
+        assert_eq!(args.last().map(String::as_str), Some("10.147.20.9"));
+    }
+}
+
 fn trigger_ping_over_interface(interface: &str, dest_ip: &str) -> bool {
     let output = Command::new("ping")
         // Live fallback peers may need the first packet to trigger WHOIS/discovery.
-        .args(["-c", "3", "-W", "1", "-i", "1", "-I", interface, dest_ip])
+        .args(ping_over_interface_args(interface, dest_ip))
         .output();
     match output {
         Ok(output) => {
@@ -2457,7 +2690,34 @@ fn classify_official_refresh_failure(outcome: &OfficialToManytierRefreshOutcome)
     notes
 }
 
+/// Find the interface carrying `ip_addr` in `ifconfig -a` output.
+fn interface_name_for_ipv4_in_ifconfig(output: &str, ip_addr: &str) -> Option<String> {
+    let mut current: Option<String> = None;
+    for line in output.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            current = line.split(':').next().map(|name| name.trim().to_string());
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("inet") && parts.next() == Some(ip_addr) {
+            return current.clone();
+        }
+    }
+    None
+}
+
 fn interface_name_for_ipv4(ip_addr: &str) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let output = Command::new("ifconfig").arg("-a").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return interface_name_for_ipv4_in_ifconfig(
+            &String::from_utf8_lossy(&output.stdout),
+            ip_addr,
+        );
+    }
+
     let output = Command::new("ip")
         .args(["-o", "-4", "addr", "show"])
         .output()
@@ -5135,8 +5395,7 @@ pub mod tests {
         );
 
         let client_data_dir = client_process.layout.home_dir.clone();
-        let client_ready =
-            wait_for_manytier_ready(&client_data_dir, std::time::Duration::from_secs(30));
+        let client_ready = wait_for_manytier_ready(&client_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !client_ready {
             let controller_status = controller_child
                 .try_wait()
@@ -5147,7 +5406,7 @@ pub mod tests {
             }
             let client_result = finish_host_native_process(client_process);
             panic!(
-                "ManyTier client did not finish identity/API startup in 30s.\n{}",
+                "ManyTier client did not finish identity/API startup in 120s.\n{}",
                 format_host_native_check(&client_result)
             );
         }
@@ -5670,11 +5929,11 @@ pub mod tests {
         // Step 2: Read ManyTier controller's ZT address and authtoken.
         let controller_data_dir = controller_process.layout.home_dir.clone();
         let controller_ready =
-            wait_for_manytier_ready(&controller_data_dir, std::time::Duration::from_secs(30));
+            wait_for_manytier_ready(&controller_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !controller_ready {
             let controller_result = finish_host_native_process(controller_process);
             panic!(
-                "ManyTier controller did not finish identity/API startup in 30s.\n{}",
+                "ManyTier controller did not finish identity/API startup in 120s.\n{}",
                 format_host_native_check(&controller_result)
             );
         }
@@ -5759,13 +6018,12 @@ pub mod tests {
         );
 
         let client_data_dir = client_process.layout.home_dir.clone();
-        let client_ready =
-            wait_for_manytier_ready(&client_data_dir, std::time::Duration::from_secs(30));
+        let client_ready = wait_for_manytier_ready(&client_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !client_ready {
             let controller_result = finish_host_native_process(controller_process);
             let client_result = finish_host_native_process(client_process);
             panic!(
-                "ManyTier client 1 did not finish identity/API startup in 30s.\n\
+                "ManyTier client 1 did not finish identity/API startup in 120s.\n\
                  Controller:\n{}\n\nClient:\n{}",
                 format_host_native_check(&controller_result),
                 format_host_native_check(&client_result)
@@ -5825,14 +6083,13 @@ pub mod tests {
         );
 
         let peer2_data_dir = peer2_process.layout.home_dir.clone();
-        let peer2_ready =
-            wait_for_manytier_ready(&peer2_data_dir, std::time::Duration::from_secs(30));
+        let peer2_ready = wait_for_manytier_ready(&peer2_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !peer2_ready {
             let controller_result = finish_host_native_process(controller_process);
             let client_result = finish_host_native_process(client_process);
             let peer2_result = finish_host_native_process(peer2_process);
             panic!(
-                "ManyTier client 2 did not finish identity/API startup in 30s.\n\
+                "ManyTier client 2 did not finish identity/API startup in 120s.\n\
                  Controller:\n{}\n\nClient 1:\n{}\n\nClient 2:\n{}",
                 format_host_native_check(&controller_result),
                 format_host_native_check(&client_result),
@@ -5883,6 +6140,8 @@ pub mod tests {
             );
         }
 
+        let mut routed_packet_evidence: Option<RoutedPacketEvidence> = None;
+        let mut warmup_packet_evidence: Option<RoutedPacketEvidence> = None;
         if let (
             Some(network_id),
             Some(client_token),
@@ -5908,12 +6167,15 @@ pub mod tests {
                 network_id,
                 std::time::Duration::from_secs(10),
             );
-            if let (Some(client_ip), Some(peer2_ip), Some(client_tun), Some(peer2_tun)) = (
-                client_ip,
-                peer2_ip,
-                fallback_tun_name(network_id, &client_addr),
-                fallback_tun_name(network_id, &peer2_addr),
-            ) {
+            let client_tun = client_ip
+                .as_deref()
+                .and_then(|ip| fallback_interface_name(network_id, &client_addr, ip));
+            let peer2_tun = peer2_ip
+                .as_deref()
+                .and_then(|ip| fallback_interface_name(network_id, &peer2_addr, ip));
+            if let (Some(client_ip), Some(peer2_ip), Some(client_tun), Some(peer2_tun)) =
+                (client_ip, peer2_ip, client_tun, peer2_tun)
+            {
                 let client_refresh =
                     join_network_via_manytier_api(CLIENT_API_PORT, client_token, network_id);
                 let peer2_refresh =
@@ -5922,7 +6184,67 @@ pub mod tests {
                     "[fallback-mt] Config refresh triggered after both assigned IPv4s were observed: client1={}, client2={}",
                     client_refresh, peer2_refresh
                 );
+                // Wait for the refreshed config.
+                let client_ready = wait_for_network_status_ok_via_manytier_api(
+                    CLIENT_API_PORT,
+                    client_token,
+                    network_id,
+                    std::time::Duration::from_secs(10),
+                );
+                let peer2_ready = wait_for_network_status_ok_via_manytier_api(
+                    PEER2_API_PORT,
+                    peer2_token,
+                    network_id,
+                    std::time::Duration::from_secs(10),
+                );
+                eprintln!(
+                    "[fallback-mt] Network status OK after refresh: client1={}, client2={}",
+                    client_ready, peer2_ready
+                );
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                // Warm up both directions first; captured for diagnostics only.
+                let client_warmup_capture = spawn_interface_icmp_capture(
+                    &shadow_test_dir,
+                    "fallback-mt-warmup-client1",
+                    &client_tun,
+                );
+                let peer2_warmup_capture = spawn_interface_icmp_capture(
+                    &shadow_test_dir,
+                    "fallback-mt-warmup-client2",
+                    &peer2_tun,
+                );
+                if client_warmup_capture.is_some() || peer2_warmup_capture.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                }
+                let client_warmup = trigger_ping_over_interface(&client_tun, &peer2_ip);
+                let peer2_warmup = trigger_ping_over_interface(&peer2_tun, &client_ip);
+                eprintln!(
+                    "[fallback-mt] Warm-up pings: {} -> {} = {}, {} -> {} = {}",
+                    client_tun, peer2_ip, client_warmup, peer2_tun, client_ip, peer2_warmup
+                );
+                warmup_packet_evidence = finish_interface_icmp_captures(
+                    client_warmup_capture,
+                    peer2_warmup_capture,
+                    &client_ip,
+                    &peer2_ip,
+                );
+                if warmup_packet_evidence.is_none() {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                // Capture ICMP on both utuns.
+                let client_capture = spawn_interface_icmp_capture(
+                    &shadow_test_dir,
+                    "fallback-mt-client1",
+                    &client_tun,
+                );
+                let peer2_capture = spawn_interface_icmp_capture(
+                    &shadow_test_dir,
+                    "fallback-mt-client2",
+                    &peer2_tun,
+                );
+                if client_capture.is_some() || peer2_capture.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                }
                 let client_ping = trigger_ping_over_interface(&client_tun, &peer2_ip);
                 let peer2_ping = trigger_ping_over_interface(&peer2_tun, &client_ip);
                 eprintln!(
@@ -5932,6 +6254,12 @@ pub mod tests {
                 eprintln!(
                     "[fallback-mt] Data-plane trigger: {}({}) -> {} via {} = {}",
                     peer2_tun, peer2_ip, client_ip, peer2_tun, peer2_ping
+                );
+                routed_packet_evidence = finish_interface_icmp_captures(
+                    client_capture,
+                    peer2_capture,
+                    &client_ip,
+                    &peer2_ip,
                 );
             } else {
                 eprintln!(
@@ -6054,6 +6382,22 @@ pub mod tests {
 
         // Write the data-plane evidence section to the report.
         let tun_tap_available = host_tun_tap_available();
+        // macOS: the receiver's capture must show the echo request.
+        let routed_packet_confirmed = routed_packet_evidence
+            .as_ref()
+            .map(|evidence| evidence.confirmed)
+            .unwrap_or(!cfg!(target_os = "macos"));
+        let routed_packet_report = routed_packet_evidence
+            .as_ref()
+            .map(RoutedPacketEvidence::report)
+            .unwrap_or_else(|| {
+                "Routed-packet capture: not attempted (only the macOS utun lane captures pcaps)\n"
+                    .to_string()
+            });
+        let warmup_report = warmup_packet_evidence
+            .as_ref()
+            .map(|evidence| format!("Warm-up round (diagnostic only):\n{}", evidence.report()))
+            .unwrap_or_default();
         let data_plane_report = format!(
             "=== Data-Plane Verification ===\n\
              Execution lane: {}\n\
@@ -6061,12 +6405,16 @@ pub mod tests {
              TUN/TAP available: {}\n\
              Join evidence found: {}\n\
              Data-plane (frame exchange) evidence found: {}\n\
-             Note: failure here names whether join or frame exchange broke.\n",
+             Routed-packet capture confirmed: {}\n\
+             Note: failure here names whether join or frame exchange broke.\n{}{}",
             live_execution_lane_label(),
             EVIDENCE_HOST_NATIVE,
             tun_tap_available,
             join_evidence,
             data_plane_evidence,
+            routed_packet_confirmed,
+            routed_packet_report,
+            warmup_report,
         );
         let report_path = shadow_test_dir.join("fallback-data-plane-evidence.txt");
         std::fs::write(&report_path, &data_plane_report)
@@ -6077,12 +6425,13 @@ pub mod tests {
         enforce_live_data_plane_lane(
             "fallback-mt",
             tun_tap_available,
-            data_plane_evidence,
+            data_plane_evidence && routed_packet_confirmed,
             &failure_category,
             &format!(
                 "PROTOCOL FAILURE: the privileged live lane requires fallback data-plane \
-                 evidence once the peers attempt to join.\nFailure category:\n{}",
-                failure_category
+                 evidence once the peers attempt to join (log frame exchange: {}, routed-packet \
+                 capture: {}).\nFailure category:\n{}",
+                data_plane_evidence, routed_packet_confirmed, failure_category
             ),
         );
 
@@ -6207,11 +6556,11 @@ pub mod tests {
         // Step 2: Read ManyTier controller identity and authtoken.
         let controller_data_dir = controller_process.layout.home_dir.clone();
         let controller_ready =
-            wait_for_manytier_ready(&controller_data_dir, std::time::Duration::from_secs(30));
+            wait_for_manytier_ready(&controller_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !controller_ready {
             let controller_result = finish_host_native_process(controller_process);
             panic!(
-                "ManyTier controller did not finish identity/API startup in 30s.\n{}",
+                "ManyTier controller did not finish identity/API startup in 120s.\n{}",
                 format_host_native_check(&controller_result)
             );
         }
@@ -6407,13 +6756,12 @@ pub mod tests {
                 .map(|(localhost_planet, _, _)| localhost_planet.as_path()),
         );
         let peer_data_dir = peer_process.layout.home_dir.clone();
-        let peer_ready =
-            wait_for_manytier_ready(&peer_data_dir, std::time::Duration::from_secs(30));
+        let peer_ready = wait_for_manytier_ready(&peer_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !peer_ready {
             let controller_result = finish_host_native_process(controller_process);
             let peer_result = finish_host_native_process(peer_process);
             panic!(
-                "ManyTier mixed-lane peer did not finish identity/API startup in 30s.\n\
+                "ManyTier mixed-lane peer did not finish identity/API startup in 120s.\n\
                  Controller:\n{}\n\nPeer:\n{}",
                 format_host_native_check(&controller_result),
                 format_host_native_check(&peer_result)
@@ -7782,11 +8130,11 @@ pub mod tests {
         );
         let controller_data_dir = controller_process.layout.home_dir.clone();
         let controller_ready =
-            wait_for_manytier_ready(&controller_data_dir, std::time::Duration::from_secs(30));
+            wait_for_manytier_ready(&controller_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !controller_ready {
             let controller_result = finish_host_native_process(controller_process);
             panic!(
-                "ManyTier controller did not finish identity/API startup in 30s.\n{}",
+                "ManyTier controller did not finish identity/API startup in 120s.\n{}",
                 format_host_native_check(&controller_result)
             );
         }
@@ -8113,11 +8461,11 @@ pub mod tests {
         );
         let controller_data_dir = controller_process.layout.home_dir.clone();
         let controller_ready =
-            wait_for_manytier_ready(&controller_data_dir, std::time::Duration::from_secs(30));
+            wait_for_manytier_ready(&controller_data_dir, MANYTIER_STARTUP_TIMEOUT);
         if !controller_ready {
             let controller_result = finish_host_native_process(controller_process);
             panic!(
-                "ManyTier controller did not finish identity/API startup in 30s.\n{}",
+                "ManyTier controller did not finish identity/API startup in 120s.\n{}",
                 format_host_native_check(&controller_result)
             );
         }
