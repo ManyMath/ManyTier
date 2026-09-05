@@ -635,12 +635,14 @@ impl Node {
             .as_ref()
             .map(|p| p.timestamp)
             .unwrap_or(0);
+        let packet_id = self.allocate_packet_id();
         let mut buf = [0u8; 512];
         if let Ok((len, _)) = RootManager::build_hello(
             &self.identity,
             peer_address,
             target,
             now_ms,
+            packet_id,
             &hello_secret,
             &mut buf,
             planet_id,
@@ -746,29 +748,34 @@ impl Node {
     pub fn send_whois(&mut self, addresses: &[[u8; 5]], now_ms: u64) -> Vec<NodeAction> {
         let mut actions = Vec::new();
         for root_addr in &self.topology.roots.clone() {
-            if let Some(root_peer) = self.topology.get_peer(root_addr) {
-                if let Some(path) = root_peer.best_path(now_ms) {
-                    let shared_secret = match self.shared_secret_for_peer(root_addr) {
-                        Some(secret) => secret,
-                        None => continue,
-                    };
-                    let mut buf = [0u8; 512];
-                    if let Ok((len, _packet_id)) = crate::root::RootManager::build_whois(
-                        &self.identity,
-                        root_addr,
-                        addresses,
-                        &shared_secret,
-                        now_ms,
-                        &mut buf,
-                    ) {
-                        actions.push(NodeAction::SendTo {
-                            data: buf[..len].to_vec(),
-                            address: path.address,
-                        });
-                    }
-                    break; // Send to first reachable root
-                }
+            let Some(path_address) = self
+                .topology
+                .get_peer(root_addr)
+                .and_then(|root_peer| root_peer.best_path(now_ms))
+                .map(|path| path.address)
+            else {
+                continue;
+            };
+            let shared_secret = match self.shared_secret_for_peer(root_addr) {
+                Some(secret) => secret,
+                None => continue,
+            };
+            let packet_id = self.allocate_packet_id();
+            let mut buf = [0u8; 512];
+            if let Ok((len, _packet_id)) = crate::root::RootManager::build_whois(
+                &self.identity,
+                root_addr,
+                addresses,
+                &shared_secret,
+                packet_id,
+                &mut buf,
+            ) {
+                actions.push(NodeAction::SendTo {
+                    data: buf[..len].to_vec(),
+                    address: path_address,
+                });
             }
+            break; // Send to first reachable root
         }
         actions
     }
@@ -1290,6 +1297,7 @@ impl Node {
             );
 
             // Build and send OK(HELLO) response
+            let reply_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok(len) = RootManager::build_ok_hello(
                 &self.identity,
@@ -1297,7 +1305,7 @@ impl Node {
                 packet_id,
                 hello.timestamp,
                 &shared_secret,
-                now_ms,
+                reply_id,
                 false,
                 &mut buf,
             ) {
@@ -1404,12 +1412,14 @@ impl Node {
                                     .as_ref()
                                     .map(|p| p.timestamp)
                                     .unwrap_or(0);
+                                let packet_id = self.allocate_packet_id();
                                 let mut hello_buf = [0u8; 512];
                                 if let Ok((len, _)) = RootManager::build_hello(
                                     &self.identity,
                                     &addr_bytes,
                                     root_phys,
                                     now_ms,
+                                    packet_id,
                                     &hello_secret,
                                     &mut hello_buf,
                                     planet_id,
@@ -1880,12 +1890,14 @@ impl Node {
                     .as_ref()
                     .map(|p| p.timestamp)
                     .unwrap_or(0);
+                let packet_id = self.allocate_packet_id();
                 let mut buf = [0u8; 512];
                 if let Ok((len, _)) = RootManager::build_hello(
                     &self.identity,
                     &rendezvous.peer_address,
                     target_addr,
                     now_ms,
+                    packet_id,
                     &hello_secret,
                     &mut buf,
                     planet_id,
@@ -2000,6 +2012,7 @@ impl Node {
 
         // Tell source peer about dest's physical address
         let dest_inet = InetAddress::from_socket_addr(dest_phys);
+        let packet_id = self.allocate_packet_id();
         let mut buf = [0u8; 128];
         if let Ok(len) = RootManager::build_rendezvous(
             &self.identity,
@@ -2007,7 +2020,7 @@ impl Node {
             dest,
             dest_inet,
             &source_secret,
-            now_ms,
+            packet_id,
             &mut buf,
         ) {
             self.actions.push(NodeAction::SendTo {
@@ -2018,6 +2031,7 @@ impl Node {
 
         // Tell dest peer about source's physical address
         let source_inet = InetAddress::from_socket_addr(source_phys);
+        let packet_id = self.allocate_packet_id();
         let mut buf = [0u8; 128];
         if let Ok(len) = RootManager::build_rendezvous(
             &self.identity,
@@ -2025,7 +2039,7 @@ impl Node {
             source,
             source_inet,
             &dest_secret,
-            now_ms,
+            packet_id,
             &mut buf,
         ) {
             self.actions.push(NodeAction::SendTo {
@@ -2331,12 +2345,14 @@ impl Node {
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
 
+            let packet_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok((len, _packet_id)) = RootManager::build_hello(
                 &self.identity,
                 addr,
                 *phys_addr,
                 now_ms,
+                packet_id,
                 &hello_secret,
                 &mut buf,
                 planet_id,
@@ -2387,12 +2403,14 @@ impl Node {
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
 
+            let packet_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok((len, _packet_id)) = RootManager::build_hello(
                 &self.identity,
                 addr,
                 *phys_addr,
                 now_ms,
+                packet_id,
                 &hello_secret,
                 &mut buf,
                 planet_id,
@@ -2434,12 +2452,14 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
+            let packet_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
                 addr,
                 *phys_addr,
                 now_ms,
+                packet_id,
                 &hello_secret,
                 &mut buf,
                 planet_id,
@@ -2493,12 +2513,14 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
+            let packet_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
                 addr,
                 *phys_addr,
                 now_ms,
+                packet_id,
                 &hello_secret,
                 &mut buf,
                 planet_id,
@@ -2690,12 +2712,14 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
+            let packet_id = self.allocate_packet_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
                 &root_addr,
                 phys_addr,
                 now_ms,
+                packet_id,
                 &hello_secret,
                 &mut buf,
                 planet_id,
@@ -4669,6 +4693,7 @@ mod tests {
             controller.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             1000,
+            0x7000,
             &shared_secret,
             &mut buf,
             zerotier_protocol::constants::WORLD_ID_EARTH,
@@ -4735,6 +4760,7 @@ mod tests {
             controller.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             3000,
+            0x7000,
             &forged_shared,
             &mut buf,
             zerotier_protocol::constants::WORLD_ID_EARTH,

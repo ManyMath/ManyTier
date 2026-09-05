@@ -58,6 +58,7 @@ impl RootManager {
         dest_address: &[u8; 5],
         dest_physical: core::net::SocketAddr,
         now_ms: u64,
+        packet_id: u64,
         shared_secret: &[u8; 48],
         buf: &mut [u8],
         planet_world_id: u64,
@@ -70,8 +71,8 @@ impl RootManager {
             });
         }
 
-        // Generate packet ID from timestamp (used as IV)
-        let packet_id = now_ms;
+        // The packet ID doubles as the Salsa20 IV / Poly1305 key seed, so
+        // the caller allocates it from a counter rather than the clock.
         buf[0..8].copy_from_slice(&packet_id.to_be_bytes());
 
         // Destination address
@@ -143,7 +144,7 @@ impl RootManager {
         dest_address: &[u8; 5],
         addresses: &[[u8; 5]],
         shared_secret: &[u8; 48],
-        now_ms: u64,
+        packet_id: u64,
         buf: &mut [u8],
     ) -> Result<(usize, u64), ProtocolError> {
         if buf.len() < ZT_PROTO_MIN_PACKET_LENGTH + addresses.len() * 5 {
@@ -153,8 +154,6 @@ impl RootManager {
             });
         }
 
-        // Packet ID
-        let packet_id = now_ms;
         buf[0..8].copy_from_slice(&packet_id.to_be_bytes());
 
         // Destination
@@ -194,7 +193,7 @@ impl RootManager {
         in_re_packet_id: u64,
         timestamp_echo: u64,
         shared_secret: &[u8; 48],
-        now_ms: u64,
+        packet_id: u64,
         use_unmangled_null: bool,
         buf: &mut [u8],
     ) -> Result<usize, ProtocolError> {
@@ -205,7 +204,6 @@ impl RootManager {
             });
         }
 
-        let packet_id = now_ms;
         buf[0..8].copy_from_slice(&packet_id.to_be_bytes());
         buf[8..13].copy_from_slice(dest_address);
         buf[13..18].copy_from_slice(our_identity.address.as_bytes());
@@ -256,7 +254,7 @@ impl RootManager {
         target_peer_address: &[u8; 5],
         target_physical: InetAddress,
         shared_secret: &[u8; 48],
-        now_ms: u64,
+        packet_id: u64,
         buf: &mut [u8],
     ) -> Result<usize, ProtocolError> {
         if buf.len() < ZT_PROTO_MIN_PACKET_LENGTH + 32 {
@@ -266,7 +264,6 @@ impl RootManager {
             });
         }
 
-        let packet_id = now_ms;
         buf[0..8].copy_from_slice(&packet_id.to_be_bytes());
         buf[8..13].copy_from_slice(dest_address);
         buf[13..18].copy_from_slice(our_identity.address.as_bytes());
@@ -329,6 +326,7 @@ mod tests {
             &dest,
             dest_phys,
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &secret,
             &mut buf,
             WORLD_ID_EARTH,
@@ -442,6 +440,7 @@ mod tests {
             server.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &shared,
             &mut buf,
             WORLD_ID_EARTH,
@@ -560,6 +559,7 @@ mod tests {
             server.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &shared,
             &mut buf,
             custom_planet_id,
@@ -684,6 +684,7 @@ mod tests {
             controller_id.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &client_dh,
             &mut buf,
             WORLD_ID_EARTH,
@@ -713,6 +714,7 @@ mod tests {
             &dest,
             dest_phys,
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &secret,
             &mut buf,
             WORLD_ID_EARTH,
@@ -751,6 +753,7 @@ mod tests {
             controller_id.address.as_bytes(),
             "127.0.0.1:29993".parse().unwrap(),
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &client_dh,
             &mut buf,
             WORLD_ID_EARTH,
@@ -811,6 +814,7 @@ mod tests {
             server.address.as_bytes(),
             "127.0.0.1:9993".parse().unwrap(),
             1000,
+            0x1000_0000_0000_0000 | 1000,
             &shared,
             &mut buf,
             WORLD_ID_EARTH,
