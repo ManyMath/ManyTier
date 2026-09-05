@@ -8,12 +8,15 @@ use crate::error::ProtocolError;
 use crate::identity_wire;
 use crate::inet_address::InetAddress;
 
+/// Sentinels that ZeroTier One wraps around the world body when signing it
+/// (`World::serialize(b, forSign = true)`, node/World.hpp). They are not part
+/// of the stored or transmitted format.
 pub const WORLD_START_SENTINEL: [u8; 8] = [0x7f; 8];
 
 pub const WORLD_END_SENTINEL: [u8; 8] = [0xf7; 8];
 
-/// Minimum world binary size: 8 (start) + 1 (type) + 8 (id) + 8 (ts) + 64 (signing key) + 96 (sig) + 1 (root count) + 8 (end) = 194.
-const WORLD_MIN_SIZE: usize = 194;
+/// Minimum world binary size: 1 (type) + 8 (id) + 8 (ts) + 64 (signing key) + 96 (sig) + 1 (root count) = 178.
+const WORLD_MIN_SIZE: usize = 178;
 
 /// Default planet binary extracted from official ZeroTier installation.
 /// Contains the official ZeroTier root server identities and endpoints.
@@ -77,52 +80,54 @@ pub struct World {
 impl World {
     /// Deserialize a world definition from binary format.
     pub fn deserialize(data: &[u8]) -> Result<Self, ProtocolError> {
-        if data.len() < WORLD_MIN_SIZE {
+        // Earlier ManyTier releases stored worlds wrapped in the signing
+        // sentinels. Those files (including moons already deployed) stay
+        // loadable: strip the wrapper and parse the upstream body.
+        let body = if data.len() >= 16
+            && data[0..8] == WORLD_START_SENTINEL
+            && data[data.len() - 8..] == WORLD_END_SENTINEL
+        {
+            &data[8..data.len() - 8]
+        } else {
+            data
+        };
+
+        if body.len() < WORLD_MIN_SIZE {
             return Err(ProtocolError::TooShort {
                 need: WORLD_MIN_SIZE,
-                got: data.len(),
+                got: body.len(),
             });
         }
 
-        // Check start sentinel
-        if data[0..8] != WORLD_START_SENTINEL {
-            return Err(ProtocolError::InvalidPacket);
-        }
-
-        // Check end sentinel
-        if data[data.len() - 8..] != WORLD_END_SENTINEL {
-            return Err(ProtocolError::InvalidPacket);
-        }
-
         // Parse type
-        let world_type = WorldType::from_byte(data[8]).ok_or(ProtocolError::InvalidPacket)?;
+        let world_type = WorldType::from_byte(body[0]).ok_or(ProtocolError::InvalidPacket)?;
 
         // Parse world ID (u64 BE)
         let id = u64::from_be_bytes([
-            data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
+            body[1], body[2], body[3], body[4], body[5], body[6], body[7], body[8],
         ]);
 
         // Parse timestamp (u64 BE)
         let timestamp = u64::from_be_bytes([
-            data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
+            body[9], body[10], body[11], body[12], body[13], body[14], body[15], body[16],
         ]);
 
-        // Copy signing key (64 bytes at offset 25)
+        // Copy signing key (64 bytes at offset 17)
         let mut signing_key = [0u8; 64];
-        signing_key.copy_from_slice(&data[25..89]);
+        signing_key.copy_from_slice(&body[17..81]);
 
-        // Copy signature (96 bytes at offset 89)
+        // Copy signature (96 bytes at offset 81)
         let mut signature = [0u8; 96];
-        signature.copy_from_slice(&data[89..185]);
+        signature.copy_from_slice(&body[81..177]);
 
         // Parse root count
-        let root_count = data[185] as usize;
+        let root_count = body[177] as usize;
         if root_count > WORLD_MAX_ROOTS {
             return Err(ProtocolError::InvalidPacket);
         }
 
-        let mut pos = 186;
-        let end_pos = data.len() - 8; // before end sentinel
+        let mut pos = 178;
+        let end_pos = body.len();
 
         let mut roots = Vec::with_capacity(root_count);
         for _ in 0..root_count {
@@ -134,7 +139,7 @@ impl World {
             }
 
             // Deserialize identity
-            let (identity, id_consumed) = identity_wire::deserialize_identity(&data[pos..])?;
+            let (identity, id_consumed) = identity_wire::deserialize_identity(&body[pos..])?;
             pos += id_consumed;
 
             if pos >= end_pos {
@@ -145,7 +150,7 @@ impl World {
             }
 
             // Endpoint count
-            let ep_count = data[pos] as usize;
+            let ep_count = body[pos] as usize;
             if ep_count > WORLD_MAX_ENDPOINTS_PER_ROOT {
                 return Err(ProtocolError::InvalidPacket);
             }
@@ -159,7 +164,7 @@ impl World {
                         got: end_pos,
                     });
                 }
-                let (addr, addr_consumed) = InetAddress::deserialize(&data[pos..end_pos])?;
+                let (addr, addr_consumed) = InetAddress::deserialize(&body[pos..end_pos])?;
                 endpoints.push(addr);
                 pos += addr_consumed;
             }
@@ -178,7 +183,7 @@ impl World {
                     got: end_pos,
                 });
             }
-            let dict_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            let dict_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
             pos += 2;
             if pos + dict_len > end_pos {
                 return Err(ProtocolError::TooShort {
@@ -186,7 +191,7 @@ impl World {
                     got: end_pos,
                 });
             }
-            let dict = data[pos..pos + dict_len].to_vec();
+            let dict = body[pos..pos + dict_len].to_vec();
             pos += dict_len;
             let _ = pos; // suppress unused warning
             Some(dict)
@@ -210,10 +215,6 @@ impl World {
     /// Returns the number of bytes written, or an error if the buffer is too small.
     pub fn serialize(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
         let mut pos = 0;
-
-        // Start sentinel
-        buf[pos..pos + 8].copy_from_slice(&WORLD_START_SENTINEL);
-        pos += 8;
 
         // Type
         buf[pos] = self.world_type.to_byte();
@@ -267,19 +268,27 @@ impl World {
             }
         }
 
-        // End sentinel
-        buf[pos..pos + 8].copy_from_slice(&WORLD_END_SENTINEL);
-        pos += 8;
-
         Ok(pos)
     }
 
-    /// Serialize the signed portion of this world definition.
-    ///
-    /// The signed portion includes everything between the sentinels except the
-    /// signature itself: type + id + timestamp + signing_key + roots.
-    /// Returns the number of bytes written.
+    /// Serialize the signed portion of this world definition, exactly as
+    /// ZeroTier One's `World::serialize(b, forSign = true)` does: the start
+    /// sentinel, then type + id + timestamp + signing_key + roots (no
+    /// signature), then the end sentinel. Returns the number of bytes written.
     pub fn signed_portion(&self, buf: &mut [u8]) -> usize {
+        buf[0..8].copy_from_slice(&WORLD_START_SENTINEL);
+        let body_len = self.signed_body(&mut buf[8..]);
+        let mut pos = 8 + body_len;
+        buf[pos..pos + 8].copy_from_slice(&WORLD_END_SENTINEL);
+        pos += 8;
+        pos
+    }
+
+    /// The signed body without the sentinels. This is what ManyTier releases
+    /// before the upstream-compatible format signed; it is still accepted by
+    /// [`World::verify_signature`] so moons generated by those releases keep
+    /// verifying.
+    fn signed_body(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
 
         // Type
@@ -349,6 +358,11 @@ impl World {
             .map_err(|_| ProtocolError::InvalidPacket)?;
         let mut buf = [0u8; 4096];
         let len = self.signed_portion(&mut buf);
+        if zerotier_crypto::signing::verify(&verifying_key, &buf[..len], &self.signature).is_ok() {
+            return Ok(());
+        }
+        // Legacy ManyTier signature over the body alone.
+        let len = self.signed_body(&mut buf);
         zerotier_crypto::signing::verify(&verifying_key, &buf[..len], &self.signature)
             .map_err(ProtocolError::CryptoError)
     }
@@ -402,27 +416,34 @@ mod tests {
         }
     }
 
+    /// Files written by earlier ManyTier releases carry the signing
+    /// sentinels around the body; they must keep loading.
     #[test]
-    fn deserialize_bad_start_sentinel_returns_err() {
-        let mut data = [0u8; 200];
-        // Wrong start sentinel
-        data[0..8].copy_from_slice(&[0x00; 8]);
-        // Correct end sentinel
-        data[192..200].copy_from_slice(&WORLD_END_SENTINEL);
-        assert!(World::deserialize(&data).is_err());
+    fn deserialize_accepts_legacy_sentinel_wrapped_world() {
+        let world = new_test_world(WorldType::Moon, 1, 1);
+        let mut buf = [0u8; 2048];
+        let n = world.serialize(&mut buf).unwrap();
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&WORLD_START_SENTINEL);
+        wrapped.extend_from_slice(&buf[..n]);
+        wrapped.extend_from_slice(&WORLD_END_SENTINEL);
+        let parsed = World::deserialize(&wrapped).unwrap();
+        assert_eq!(parsed.id, world.id);
+        assert_eq!(parsed.roots.len(), 1);
     }
 
+    /// The stored/wire format has no sentinels (ZeroTier One
+    /// `World::serialize(b, false)`), so serialized output starts with the
+    /// type byte and ends with the last root (or the moon dictionary length).
     #[test]
-    fn deserialize_bad_end_sentinel_returns_err() {
-        let mut data = [0u8; 200];
-        // Correct start sentinel
-        data[0..8].copy_from_slice(&WORLD_START_SENTINEL);
-        // Wrong end sentinel
-        data[192..200].copy_from_slice(&[0x00; 8]);
-        // Type = planet, 0 roots
-        data[8] = WORLD_TYPE_PLANET;
-        data[185] = 0; // 0 roots
-        assert!(World::deserialize(&data).is_err());
+    fn serialize_emits_upstream_layout_without_sentinels() {
+        let world = new_test_world(WorldType::Planet, 1, 1);
+        let mut buf = [0u8; 2048];
+        let n = world.serialize(&mut buf).unwrap();
+        assert_eq!(buf[0], WORLD_TYPE_PLANET);
+        assert_ne!(&buf[..8], &WORLD_START_SENTINEL);
+        assert_ne!(&buf[n - 8..n], &WORLD_END_SENTINEL);
+        assert_eq!(&buf[1..9], &world.id.to_be_bytes());
     }
 
     #[test]
@@ -539,20 +560,20 @@ mod tests {
         }
     }
 
+    /// The official planet is signed by the key it embeds
+    /// (`attic/world/mkworld.cpp` signs with the same C25519 pair it writes
+    /// into `_updatesMustBeSignedBy`), over the sentinel-wrapped body.
     #[test]
-    fn default_planet_signature_does_not_self_verify() {
-        // The bundled default planet's `signature` is NOT expected to verify
-        // against its own embedded `signing_key`: upstream ZeroTier's
-        // `signing_key` field (`_updatesMustBeSignedBy`) names the key
-        // required to sign a FUTURE replacement world, not the key that
-        // signed this one. A genesis/bootstrap world (id != 0, but no prior
-        // world to chain from) has no self-referential verification --
-        // upstream trusts it unconditionally once bundled with the release.
-        // `verify_signature()` is still useful for a world an operator
-        // generates and embeds its own signing identity into (e.g.
-        // ManyTier's `moon generate`), which is self-referential.
+    fn default_planet_signature_verifies() {
         let world = World::deserialize(DEFAULT_PLANET).unwrap();
-        assert!(world.verify_signature().is_err());
+        assert!(world.verify_signature().is_ok());
+    }
+
+    /// The bundled fixture is the raw upstream `planet` file.
+    #[test]
+    fn default_planet_is_in_upstream_layout() {
+        assert_eq!(DEFAULT_PLANET[0], WORLD_TYPE_PLANET);
+        assert_ne!(&DEFAULT_PLANET[..8], &WORLD_START_SENTINEL);
     }
 
     #[test]
@@ -584,14 +605,16 @@ mod tests {
     }
 
     #[test]
-    fn signed_portion_excludes_sentinels_and_signature() {
+    fn signed_portion_wraps_body_in_sentinels_and_omits_signature() {
         let world = new_test_world(WorldType::Planet, 1, 1);
         let mut buf = [0u8; 2048];
         let n = world.signed_portion(&mut buf);
-        // signed_portion should NOT contain sentinels or signature
-        // It should start with the type byte
-        assert_eq!(buf[0], WORLD_TYPE_PLANET);
-        // It should contain type(1) + id(8) + ts(8) + signing_key(64) + root_count(1) + root data
-        assert!(n > 82); // at minimum type+id+ts+key+count
+        assert_eq!(&buf[..8], &WORLD_START_SENTINEL);
+        assert_eq!(buf[8], WORLD_TYPE_PLANET);
+        assert_eq!(&buf[n - 8..n], &WORLD_END_SENTINEL);
+        // type(1) + id(8) + ts(8) + signing_key(64) + root_count(1) + root data, no signature
+        let mut serialized = [0u8; 2048];
+        let serialized_len = world.serialize(&mut serialized).unwrap();
+        assert_eq!(n, serialized_len - 96 + 16);
     }
 }
