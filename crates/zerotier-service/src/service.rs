@@ -717,7 +717,7 @@ async fn handle_controller_actions(
 
             // Record the issued COM in the node's own membership state so it can verify
             // incoming data-plane frames from this peer.
-            if let Some(ref com) = response.credentials.com {
+            if let Some(com) = response.credentials.com() {
                 if let Some(net) = node.find_network_mut(*network_id) {
                     net.peer_coms.retain(|(addr, _)| addr != requester_address);
                     net.peer_coms.push((*requester_address, com.clone()));
@@ -761,7 +761,7 @@ async fn handle_controller_actions(
                 ),
                 network_id = %format_args!("{:016x}", network_id),
                 dict_len = response.config.dict_data.len(),
-                credentials_has_com = response.credentials.com.is_some(),
+                credentials_has_com = response.credentials.com().is_some(),
                 "controller built NETWORK_CONFIG response"
             );
 

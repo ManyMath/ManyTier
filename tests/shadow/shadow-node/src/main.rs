@@ -685,11 +685,8 @@ fn handle_controller_actions(
                 );
 
                 let creds_payload = NetworkCredentialsPayload {
-                    com: Some(com),
-                    capabilities_raw: Vec::new(),
-                    tags_raw: Vec::new(),
-                    revocations_raw: Vec::new(),
-                    coo_raw: Vec::new(),
+                    coms: vec![com],
+                    sections: NetworkCredentialsPayload::sections_from(0, &[], 0, &[]),
                 };
 
                 let mut creds_buf = [0u8; 2048];

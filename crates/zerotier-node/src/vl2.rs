@@ -621,7 +621,7 @@ mod tests {
             signing_key,
             controller_address,
             network_id,
-            0,
+            crate::controller::engine::zt_address_to_u64(peer_addr),
             1050,
         );
         let net = node.find_network_mut(network_id).unwrap();

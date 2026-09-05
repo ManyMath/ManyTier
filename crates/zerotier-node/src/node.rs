@@ -1829,26 +1829,39 @@ impl Node {
         })
     }
 
+    /// NETWORK_CREDENTIALS carries the *sender's* credentials (ZeroTierOne
+    /// node/IncomingPacket.cpp `_doNETWORK_CREDENTIALS` adds them to that
+    /// peer's membership). Each COM issued to the sender for a network we
+    /// have joined is recorded as that peer's COM; it is verified against the
+    /// controller's key when the peer's frames are gated.
     fn handle_network_credentials(&mut self, data: &[u8], _from: SocketAddr, _now_ms: u64) {
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
-        if let Ok(creds) = NetworkCredentialsPayload::deserialize(payload_data) {
-            tracing::info!(
-                target: "manytier",
-                event = "network_credentials_received",
-                has_com = creds.com.is_some(),
-                "NETWORK_CREDENTIALS received"
-            );
-            if let Some(com) = creds.com {
-                // Find network for this COM
-                let network_id = match com.qualifiers.iter().find(|q| q.id == 1) {
-                    Some(q) => q.value,
-                    None => return,
-                };
-                if let Some(net) = self.find_network_mut(network_id) {
-                    net.pending_config_request = false;
-                    net.last_config_request = 0;
-                    net.our_com = Some(com);
-                }
+        let source = match PacketHeader::from_bytes(data) {
+            Some(hdr) => hdr.source_address(),
+            None => return,
+        };
+        let Ok(creds) = NetworkCredentialsPayload::deserialize(payload_data) else {
+            return;
+        };
+        tracing::info!(
+            target: "manytier",
+            event = "network_credentials_received",
+            peer = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
+                source[0], source[1], source[2], source[3], source[4]),
+            com_count = creds.coms.len(),
+            "NETWORK_CREDENTIALS received"
+        );
+        for com in creds.coms {
+            if com.issued_to != source {
+                continue;
+            }
+            let Some(network_id) = com.qualifiers.iter().find(|q| q.id == 1).map(|q| q.value)
+            else {
+                continue;
+            };
+            if let Some(net) = self.find_network_mut(network_id) {
+                net.peer_coms.retain(|(addr, _)| *addr != source);
+                net.peer_coms.push((source, com));
             }
         }
     }
@@ -5113,5 +5126,67 @@ mod tests {
             !ok,
             "dearmoring suite-1-armored packet with suite 3 must fail"
         );
+    }
+
+    /// NETWORK_CREDENTIALS carries the sender's COM (upstream
+    /// `_doNETWORK_CREDENTIALS` adds it to that peer's membership); it is
+    /// stored as the peer's COM, never as ours, and COMs issued to someone
+    /// else are ignored.
+    #[test]
+    fn network_credentials_records_sender_com_without_touching_ours() {
+        use crate::controller::engine::{build_signed_com, zt_address_to_u64};
+
+        let network_id = 0xff00000000abcdef_u64;
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let controller_address = controller_address_from_network_id(network_id);
+        let our_com = build_signed_com(
+            &signing_key,
+            &controller_address,
+            network_id,
+            zt_address_to_u64(node.identity.address.as_bytes()),
+            1000,
+        );
+        let mut net = NetworkMembership::new(network_id, 2800);
+        net.our_com = Some(our_com.clone());
+        node.networks.push(net);
+
+        let sender = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+        let sender_com = build_signed_com(
+            &signing_key,
+            &controller_address,
+            network_id,
+            zt_address_to_u64(&sender),
+            1050,
+        );
+        let other_com = build_signed_com(
+            &signing_key,
+            &controller_address,
+            network_id,
+            zt_address_to_u64(&[0x11; 5]),
+            1050,
+        );
+        let payload = NetworkCredentialsPayload {
+            coms: vec![other_com, sender_com.clone()],
+            sections: NetworkCredentialsPayload::sections_from(0, &[], 0, &[]),
+        };
+        let mut payload_buf = [0u8; 1024];
+        let payload_len = payload.serialize(&mut payload_buf);
+        let mut pkt = vec![0u8; 28 + payload_len];
+        pkt[0..8].copy_from_slice(&1000u64.to_be_bytes());
+        pkt[8..13].copy_from_slice(node.identity.address.as_bytes());
+        pkt[13..18].copy_from_slice(&sender);
+        pkt[27] = Verb::NetworkCredentials.to_byte();
+        pkt[28..].copy_from_slice(&payload_buf[..payload_len]);
+
+        let from: SocketAddr = "192.168.1.1:9993".parse().unwrap();
+        node.handle_network_credentials(&pkt, from, 2000);
+
+        let net = node.find_network(network_id).unwrap();
+        assert_eq!(net.our_com.as_ref(), Some(&our_com));
+        assert_eq!(net.peer_coms.len(), 1);
+        assert_eq!(net.peer_coms[0].0, sender);
+        assert_eq!(net.peer_coms[0].1, sender_com);
     }
 }

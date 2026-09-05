@@ -343,68 +343,60 @@ impl CertificateOfMembership {
 
 /// NETWORK_CREDENTIALS payload (verb 0x0a).
 ///
+/// Wire layout (ZeroTierOne node/Packet.hpp, `VERB_NETWORK_CREDENTIALS`):
+/// zero or more serialized certificates of membership, a `0x00` byte ending
+/// the COM list, then four `u16`-count-prefixed sections of capabilities,
+/// tags, revocations and certificates of ownership. Older peers omit the
+/// sections entirely.
+///
+/// The sections are carried verbatim in `sections` (count prefixes
+/// included): the objects are self-delimiting and only a full parser for
+/// each could split them, while the node only acts on the COMs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkCredentialsPayload {
-    pub com: Option<CertificateOfMembership>,
-    pub capabilities_raw: Vec<u8>,
-    pub tags_raw: Vec<u8>,
-    pub revocations_raw: Vec<u8>,
-    pub coo_raw: Vec<u8>,
+    pub coms: Vec<CertificateOfMembership>,
+    /// `[u16 caps][...][u16 tags][...][u16 revocations][...][u16 coos][...]`
+    /// exactly as on the wire, or empty for none.
+    pub sections: Vec<u8>,
 }
 
 impl NetworkCredentialsPayload {
+    /// Build the trailing sections from capability and tag object bytes.
+    ///
+    /// `capabilities` and `tags` hold the concatenated serialized objects;
+    /// the counts say how many each contains. Revocations and certificates of
+    /// ownership are always sent empty.
+    pub fn sections_from(
+        capability_count: u16,
+        capabilities: &[u8],
+        tag_count: u16,
+        tags: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + capabilities.len() + tags.len());
+        out.extend_from_slice(&capability_count.to_be_bytes());
+        out.extend_from_slice(capabilities);
+        out.extend_from_slice(&tag_count.to_be_bytes());
+        out.extend_from_slice(tags);
+        out.extend_from_slice(&0u16.to_be_bytes()); // revocations
+        out.extend_from_slice(&0u16.to_be_bytes()); // certificates of ownership
+        out
+    }
+
+    /// The first certificate of membership, if any.
+    pub fn com(&self) -> Option<&CertificateOfMembership> {
+        self.coms.first()
+    }
+
     /// Serialize into buffer. Returns bytes written.
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         let mut offset = 0;
-
-        // COM section
-        if let Some(ref com) = self.com {
-            buf[offset] = 1; // has_com
-            offset += 1;
-            let com_len = com.serialize(&mut buf[offset..]);
-            offset += com_len;
-        } else {
-            buf[offset] = 0; // no COM
-            offset += 1;
+        for com in &self.coms {
+            offset += com.serialize(&mut buf[offset..]);
         }
-
-        // Capabilities raw blob
-        let cap_len = self.capabilities_raw.len() as u16;
-        buf[offset..offset + 2].copy_from_slice(&cap_len.to_be_bytes());
-        offset += 2;
-        if !self.capabilities_raw.is_empty() {
-            buf[offset..offset + self.capabilities_raw.len()]
-                .copy_from_slice(&self.capabilities_raw);
-            offset += self.capabilities_raw.len();
-        }
-
-        // Tags raw blob
-        let tag_len = self.tags_raw.len() as u16;
-        buf[offset..offset + 2].copy_from_slice(&tag_len.to_be_bytes());
-        offset += 2;
-        if !self.tags_raw.is_empty() {
-            buf[offset..offset + self.tags_raw.len()].copy_from_slice(&self.tags_raw);
-            offset += self.tags_raw.len();
-        }
-
-        // Revocations raw blob
-        let rev_len = self.revocations_raw.len() as u16;
-        buf[offset..offset + 2].copy_from_slice(&rev_len.to_be_bytes());
-        offset += 2;
-        if !self.revocations_raw.is_empty() {
-            buf[offset..offset + self.revocations_raw.len()].copy_from_slice(&self.revocations_raw);
-            offset += self.revocations_raw.len();
-        }
-
-        // COO raw blob
-        let coo_len = self.coo_raw.len() as u16;
-        buf[offset..offset + 2].copy_from_slice(&coo_len.to_be_bytes());
-        offset += 2;
-        if !self.coo_raw.is_empty() {
-            buf[offset..offset + self.coo_raw.len()].copy_from_slice(&self.coo_raw);
-            offset += self.coo_raw.len();
-        }
-
+        buf[offset] = 0; // end of COM list
+        offset += 1;
+        buf[offset..offset + self.sections.len()].copy_from_slice(&self.sections);
+        offset += self.sections.len();
         offset
     }
 
@@ -415,51 +407,19 @@ impl NetworkCredentialsPayload {
         }
 
         let mut offset = 0;
-
-        // COM section
-        let has_com = data[offset];
-        offset += 1;
-        let com = if has_com != 0 {
+        let mut coms = Vec::new();
+        // A COM starts with its version byte (1); 0x00 ends the list.
+        while offset < data.len() && data[offset] != 0 {
             let (com, consumed) = CertificateOfMembership::deserialize(&data[offset..])?;
             offset += consumed;
-            Some(com)
-        } else {
-            None
-        };
-
-        // Read raw section: u16 length prefix then raw bytes
-        fn read_raw_section(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, ProtocolError> {
-            if *offset + 2 > data.len() {
-                return Err(ProtocolError::TooShort {
-                    need: *offset + 2,
-                    got: data.len(),
-                });
-            }
-            let len = u16::from_be_bytes([data[*offset], data[*offset + 1]]) as usize;
-            *offset += 2;
-            if *offset + len > data.len() {
-                return Err(ProtocolError::TooShort {
-                    need: *offset + len,
-                    got: data.len(),
-                });
-            }
-            let raw = data[*offset..*offset + len].to_vec();
-            *offset += len;
-            Ok(raw)
+            coms.push(com);
         }
+        if offset < data.len() {
+            offset += 1; // the terminator
+        }
+        let sections = data[offset..].to_vec();
 
-        let capabilities_raw = read_raw_section(data, &mut offset)?;
-        let tags_raw = read_raw_section(data, &mut offset)?;
-        let revocations_raw = read_raw_section(data, &mut offset)?;
-        let coo_raw = read_raw_section(data, &mut offset)?;
-
-        Ok(NetworkCredentialsPayload {
-            com,
-            capabilities_raw,
-            tags_raw,
-            revocations_raw,
-            coo_raw,
-        })
+        Ok(NetworkCredentialsPayload { coms, sections })
     }
 }
 
@@ -597,11 +557,10 @@ mod tests {
         assert_eq!(parsed.signature.len(), 96);
     }
 
-    #[test]
-    fn network_credentials_with_com() {
+    fn test_com() -> CertificateOfMembership {
         let mut sig = [0u8; 96];
         sig[0] = 0xDE;
-        let com = CertificateOfMembership {
+        CertificateOfMembership {
             issued_to: [0x01, 0x02, 0x03, 0x04, 0x05],
             qualifiers: vec![
                 ComQualifier {
@@ -617,35 +576,70 @@ mod tests {
             ],
             signer_address: [0x01, 0x02, 0x03, 0x04, 0x05],
             signature: sig,
-        };
+        }
+    }
+
+    #[test]
+    fn network_credentials_with_com() {
         let payload = NetworkCredentialsPayload {
-            com: Some(com),
-            capabilities_raw: vec![0x01, 0x02],
-            tags_raw: vec![],
-            revocations_raw: vec![0xAA],
-            coo_raw: vec![],
+            coms: vec![test_com()],
+            sections: NetworkCredentialsPayload::sections_from(1, &[0x01, 0x02], 0, &[]),
         };
         let mut buf = [0u8; 512];
         let n = payload.serialize(&mut buf);
         let parsed = NetworkCredentialsPayload::deserialize(&buf[..n]).unwrap();
         assert_eq!(parsed, payload);
+        assert_eq!(parsed.com(), Some(&test_com()));
+    }
+
+    /// Layout from ZeroTierOne node/Packet.hpp VERB_NETWORK_CREDENTIALS and
+    /// node/IncomingPacket.cpp _doNETWORK_CREDENTIALS: COMs, a 0x00
+    /// terminator, then four u16 counts (here all zero).
+    #[test]
+    fn network_credentials_matches_upstream_byte_layout() {
+        let com = test_com();
+        let mut com_bytes = [0u8; 256];
+        let com_len = com.serialize(&mut com_bytes);
+
+        let mut upstream = Vec::new();
+        upstream.extend_from_slice(&com_bytes[..com_len]);
+        upstream.push(0x00);
+        upstream.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let parsed = NetworkCredentialsPayload::deserialize(&upstream).unwrap();
+        assert_eq!(parsed.coms, vec![com]);
+        assert_eq!(parsed.sections, vec![0u8; 8]);
+
+        let mut buf = [0u8; 512];
+        let n = parsed.serialize(&mut buf);
+        assert_eq!(&buf[..n], &upstream[..]);
+    }
+
+    /// Older peers stop after the COM terminator.
+    #[test]
+    fn network_credentials_without_sections() {
+        let com = test_com();
+        let mut buf = [0u8; 256];
+        let com_len = com.serialize(&mut buf);
+        buf[com_len] = 0;
+        let parsed = NetworkCredentialsPayload::deserialize(&buf[..com_len + 1]).unwrap();
+        assert_eq!(parsed.coms.len(), 1);
+        assert!(parsed.sections.is_empty());
     }
 
     #[test]
     fn network_credentials_without_com() {
         let payload = NetworkCredentialsPayload {
-            com: None,
-            capabilities_raw: vec![],
-            tags_raw: vec![],
-            revocations_raw: vec![],
-            coo_raw: vec![],
+            coms: vec![],
+            sections: NetworkCredentialsPayload::sections_from(0, &[], 0, &[]),
         };
         let mut buf = [0u8; 64];
         let n = payload.serialize(&mut buf);
-        // 1 (has_com=0) + 4*2 (section lengths) = 9
+        // 1 (terminator) + 4*2 (section counts) = 9
         assert_eq!(n, 9);
         let parsed = NetworkCredentialsPayload::deserialize(&buf[..n]).unwrap();
         assert_eq!(parsed, payload);
+        assert!(parsed.com().is_none());
     }
 
     #[test]

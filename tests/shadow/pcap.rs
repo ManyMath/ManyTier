@@ -266,12 +266,10 @@ fn decode_payload(verb: Option<Verb>, payload: &[u8]) -> Option<DecodedPayload> 
                 .ok()
                 .map(|credentials| {
                     let signer = credentials
-                        .com
-                        .as_ref()
+                        .com()
                         .map(|com| format_address(&com.signer_address));
                     let qualifier_ids = credentials
-                        .com
-                        .as_ref()
+                        .com()
                         .map(|com| {
                             com.qualifiers
                                 .iter()
@@ -280,8 +278,7 @@ fn decode_payload(verb: Option<Verb>, payload: &[u8]) -> Option<DecodedPayload> 
                         })
                         .unwrap_or_default();
                     let qualifier_values = credentials
-                        .com
-                        .as_ref()
+                        .com()
                         .map(|com| {
                             com.qualifiers
                                 .iter()

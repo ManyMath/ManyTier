@@ -110,11 +110,15 @@ impl NetworkMembership {
     /// alone.
     pub fn verify_peer_com(
         &self,
-        _peer_address: &[u8; 5],
+        peer_address: &[u8; 5],
         peer_com: &CertificateOfMembership,
         controller_address: &[u8; 5],
         controller_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> bool {
+        // A COM issued to another member proves nothing about this peer.
+        if peer_com.issued_to != *peer_address {
+            return false;
+        }
         let our = match &self.our_com {
             Some(our) => our,
             None => return false,
@@ -642,7 +646,7 @@ mod tests {
                 },
             ],
         ));
-        let peer_com = signed_com(
+        let mut peer_com = signed_com(
             &signing_key,
             controller_address,
             vec![
@@ -658,8 +662,16 @@ mod tests {
                 },
             ],
         );
+        peer_com.issued_to = [0x01; 5];
         assert!(net.verify_peer_com(
             &[0x01; 5],
+            &peer_com,
+            &controller_address,
+            Some(&verifying_key)
+        ));
+        // The same COM proves nothing about a different peer.
+        assert!(!net.verify_peer_com(
+            &[0x02; 5],
             &peer_com,
             &controller_address,
             Some(&verifying_key)
@@ -722,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_peer_com_ignores_issued_to_qualifier() {
+    fn verify_peer_com_does_not_compare_issued_to_across_members() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
         let verifying_key = signing_key.verifying_key();
         let controller_address = [0xc0, 0xc1, 0xc2, 0xc3, 0xc4];
@@ -749,7 +761,7 @@ mod tests {
                 },
             ],
         ));
-        let peer_com = signed_com(
+        let mut peer_com = signed_com(
             &signing_key,
             controller_address,
             vec![
@@ -770,8 +782,9 @@ mod tests {
                 },
             ],
         );
+        peer_com.issued_to = [0xf0, 0xe1, 0xd2, 0xc3, 0xb4];
         assert!(net.verify_peer_com(
-            &[0x01; 5],
+            &[0xf0, 0xe1, 0xd2, 0xc3, 0xb4],
             &peer_com,
             &controller_address,
             Some(&verifying_key)

@@ -263,27 +263,19 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
         assert_eq!(config_parsed, config);
 
         let credentials = NetworkCredentialsPayload {
-            capabilities_raw: vec![1, 2, 3, seed as u8],
-            tags_raw: vec![4, 5, 6, seed.rotate_left(3) as u8],
-            revocations_raw: vec![7, seed as u8],
-            coo_raw: vec![8, 9, seed.rotate_right(2) as u8],
-            com: Some(com_from_seed(seed)),
+            coms: vec![com_from_seed(seed)],
+            sections: NetworkCredentialsPayload::sections_from(
+                1,
+                &[1, 2, 3, seed as u8],
+                1,
+                &[4, 5, 6, seed.rotate_left(3) as u8],
+            ),
         };
         let mut credentials_buf = vec![0u8; 1024];
         let credentials_len = credentials.serialize(&mut credentials_buf);
         let credentials_parsed =
             NetworkCredentialsPayload::deserialize(&credentials_buf[..credentials_len]).unwrap();
-        assert_eq!(
-            credentials_parsed.capabilities_raw,
-            credentials.capabilities_raw
-        );
-        assert_eq!(credentials_parsed.tags_raw, credentials.tags_raw);
-        assert_eq!(
-            credentials_parsed.revocations_raw,
-            credentials.revocations_raw
-        );
-        assert_eq!(credentials_parsed.coo_raw, credentials.coo_raw);
-        assert_eq!(credentials_parsed.com, credentials.com);
+        assert_eq!(credentials_parsed, credentials);
 
         let ok_generic = OkPayload {
             in_re_verb: Verb::NetworkConfig,

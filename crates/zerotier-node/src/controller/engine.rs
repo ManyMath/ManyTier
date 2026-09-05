@@ -312,11 +312,13 @@ impl<S: ControllerStorage> Controller<S> {
         // `capabilities_raw`/`tags_raw` were already computed above (needed
         // earlier now to embed into this member's own network config dict).
         let credentials = NetworkCredentialsPayload {
-            com: Some(com),
-            capabilities_raw,
-            tags_raw,
-            revocations_raw: vec![],
-            coo_raw: vec![],
+            coms: vec![com],
+            sections: NetworkCredentialsPayload::sections_from(
+                member_caps.len() as u16,
+                &capabilities_raw,
+                member.tags.len() as u16,
+                &tags_raw,
+            ),
         };
 
         Ok(ConfigResponse {
@@ -815,7 +817,7 @@ mod tests {
         assert_eq!(response.config.network_id, nid);
 
         // Credentials should have a COM
-        assert!(response.credentials.com.is_some());
+        assert!(response.credentials.com().is_some());
     }
 
     #[test]
