@@ -707,14 +707,16 @@ mod tests {
             net.last_config_request = 10_000;
         }
 
-        // A unicast address nobody in the directory owns: hold and refresh.
+        // A unicast address nobody in the directory owns: hold and refresh
+        // (the refresh is allowed once the 30 s backoff since the last
+        // request has passed).
         let actions = process_outbound_frame(
             &mut node,
             network_id,
             ethernet::ETHERTYPE_IPV4,
             &ipv4_packet_to([10, 147, 20, 9]),
             &our_addr,
-            20_000,
+            45_000,
         );
         assert!(
             actions

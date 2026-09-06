@@ -146,6 +146,17 @@ pub const ZT_DIRECT_PATH_PUSH_INTERVAL: u64 = 15_000;
 /// Interval for pushing direct paths when a direct path already exists.
 pub const ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH: u64 = 120_000;
 
+/// Window over which received PUSH_DIRECT_PATHS are counted (ms); see
+/// ZeroTierOne node/Constants.hpp `ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME`.
+pub const ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME: u64 = 30_000;
+
+/// Pushes honored per peer within the cutoff window; see ZeroTierOne
+/// node/Constants.hpp `ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT`.
+pub const ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT: u8 = 8;
+
+/// PUSH_DIRECT_PATHS record flag: forget this path (node/Packet.hpp).
+pub const PUSH_DIRECT_PATHS_FLAG_FORGET_PATH: u8 = 0x01;
+
 // --- World (planet/moon) constants ---
 
 pub const WORLD_TYPE_PLANET: u8 = 1;

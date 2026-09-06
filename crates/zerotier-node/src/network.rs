@@ -6,7 +6,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use zerotier_protocol::verbs::network_config::{CertificateOfMembership, ComQualifier};
 
@@ -68,6 +68,29 @@ impl NetworkMembership {
     }
 
     /// Look up a member by IPv4 address.
+    /// Is `ip` inside this network's managed address space, i.e. within the
+    /// prefix of any member's assigned address or equal to our own?
+    pub fn covers_ip(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                self.assigned_ipv4 == Some(v4)
+                    || self.members.iter().any(|member| {
+                        member
+                            .ipv4
+                            .is_some_and(|(addr, prefix)| ipv4_in_prefix(v4, addr, prefix))
+                    })
+            }
+            IpAddr::V6(v6) => {
+                self.assigned_ipv6 == Some(v6)
+                    || self.members.iter().any(|member| {
+                        member
+                            .ipv6
+                            .is_some_and(|(addr, prefix)| ipv6_in_prefix(v6, addr, prefix))
+                    })
+            }
+        }
+    }
+
     pub fn lookup_ipv4(&self, ip: Ipv4Addr) -> Option<&NetworkMember> {
         self.members.iter().find(|m| {
             m.ipv4
@@ -169,6 +192,26 @@ impl NetworkMembership {
             .saturating_add(qualifier.max_delta.saturating_sub(refresh_margin));
         now_ms >= refresh_at
     }
+}
+
+fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    let prefix = prefix.min(32) as u32;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(ip) & mask) == (u32::from(network) & mask)
+}
+
+fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    let prefix = prefix.min(128) as u32;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    (u128::from(ip) & mask) == (u128::from(network) & mask)
 }
 
 fn peer_com_agrees_with(ours: &CertificateOfMembership, theirs: &CertificateOfMembership) -> bool {

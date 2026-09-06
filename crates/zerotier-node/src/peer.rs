@@ -9,7 +9,10 @@ use alloc::vec::Vec;
 use core::net::SocketAddr;
 use zeroize::ZeroizeOnDrop;
 use zerotier_crypto::identity::Identity;
-use zerotier_protocol::{ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_PING_PERIOD};
+use zerotier_protocol::{
+    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_PING_PERIOD,
+    ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
+};
 
 use crate::path::Path;
 
@@ -119,6 +122,10 @@ pub struct Peer {
     pub is_root: bool,
     /// Last PUSH_DIRECT_PATHS to this peer.
     pub last_direct_path_push: u64,
+    /// Last PUSH_DIRECT_PATHS received from this peer.
+    last_direct_path_push_receive: u64,
+    /// Pushes received inside the current cutoff window.
+    direct_path_push_cutoff_count: u8,
 }
 
 impl Peer {
@@ -130,7 +137,35 @@ impl Peer {
             paths: Vec::new(),
             is_root,
             last_direct_path_push: 0,
+            last_direct_path_push_receive: 0,
+            direct_path_push_cutoff_count: 0,
         }
+    }
+
+    /// Rate gate for received PUSH_DIRECT_PATHS, as ZeroTierOne
+    /// node/Peer.hpp `rateGatePushDirectPaths`: pushes arriving within
+    /// ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME of the previous one are counted, and
+    /// only the first ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT of a burst are acted
+    /// on.
+    pub fn rate_gate_push_direct_paths(&mut self, now_ms: u64) -> bool {
+        if self.last_direct_path_push_receive != 0
+            && now_ms.saturating_sub(self.last_direct_path_push_receive)
+                <= ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME
+        {
+            self.direct_path_push_cutoff_count =
+                self.direct_path_push_cutoff_count.saturating_add(1);
+        } else {
+            self.direct_path_push_cutoff_count = 0;
+        }
+        self.last_direct_path_push_receive = now_ms;
+        self.direct_path_push_cutoff_count < ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT
+    }
+
+    /// Does an alive direct path to this peer exist?
+    pub fn has_direct_path(&self, now_ms: u64) -> bool {
+        self.paths
+            .iter()
+            .any(|path| path.is_direct && path.is_alive(now_ms))
     }
 
     /// Derive shared secret via X25519 key agreement and transition to Active.
@@ -155,10 +190,14 @@ impl Peer {
     }
 
     /// Add or update a path to this peer.
+    ///
+    /// A path already known to be direct stays direct: a packet relayed
+    /// through a root says nothing about the address it was relayed from
+    /// (ZeroTierOne only learns paths from hops == 0 packets, node/Peer.cpp).
     pub fn add_path(&mut self, addr: SocketAddr, is_direct: bool, now_ms: u64) {
         if let Some(existing) = self.paths.iter_mut().find(|p| p.address == addr) {
             existing.received(now_ms);
-            existing.is_direct = is_direct;
+            existing.is_direct |= is_direct;
         } else {
             let mut path = Path::new(addr, now_ms);
             path.is_direct = is_direct;
@@ -469,5 +508,28 @@ mod tests {
         // Direct path should win due to relay penalty (10000)
         let best = peer.best_path(1000).unwrap();
         assert_eq!(best.address, direct_addr);
+    }
+
+    #[test]
+    fn add_path_never_downgrades_a_direct_path() {
+        let mut peer = stub_peer();
+        let addr: SocketAddr = "192.0.2.1:9993".parse().unwrap();
+        peer.add_path(addr, true, 1000);
+        peer.add_path(addr, false, 2000);
+        assert!(peer.paths[0].is_direct);
+        assert_eq!(peer.paths[0].last_receive, 2000);
+        peer.add_path(addr, true, 3000);
+        assert!(peer.paths[0].is_direct);
+    }
+
+    #[test]
+    fn push_direct_paths_rate_gate_matches_upstream() {
+        let mut peer = stub_peer();
+        for i in 0..ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT {
+            assert!(peer.rate_gate_push_direct_paths(1000 + i as u64));
+        }
+        assert!(!peer.rate_gate_push_direct_paths(1100));
+        // A quiet period resets the window.
+        assert!(peer.rate_gate_push_direct_paths(1100 + ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME + 1));
     }
 }

@@ -10,7 +10,7 @@ use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use zerotier_crypto::aes_gmac_siv;
 use zerotier_crypto::identity::Identity;
 use zerotier_crypto::salsa;
@@ -685,7 +685,11 @@ impl Node {
                     && matches!(peer.state, PeerState::Active { .. })
                     && (peer.last_direct_path_push == 0
                         || now_ms.saturating_sub(peer.last_direct_path_push)
-                            >= ZT_DIRECT_PATH_PUSH_INTERVAL)
+                            >= if peer.has_direct_path(now_ms) {
+                                ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH
+                            } else {
+                                ZT_DIRECT_PATH_PUSH_INTERVAL
+                            })
             })
             .filter_map(|(addr, peer)| peer.best_path(now_ms).map(|path| (*addr, path.address)))
             .collect();
@@ -848,9 +852,11 @@ impl Node {
         // Dearmor packet (verify MAC, optionally decrypt)
         let dearmored = self.dearmor(data, &source, cipher_suite, verb_id);
         if !dearmored {
-            // MAC verification failed or no shared secret available
-            // For cipher suite 0 (HELLO), we still try to process
-            if cipher_suite != CIPHER_SUITE_C25519_POLY1305_NONE {
+            // Only HELLO authenticates itself (its handler verifies the MAC
+            // with the identity it carries); every other verb whose MAC did
+            // not verify, whatever its cipher suite, is dropped as in
+            // ZeroTierOne node/IncomingPacket.cpp `tryDecode`.
+            if verb_id != Verb::Hello.to_byte() {
                 let source_known = self.topology.get_peer(&source).is_some();
                 let from_known_root_path = self.topology.roots.iter().any(|root_addr| {
                     self.topology
@@ -934,8 +940,11 @@ impl Node {
                 .unwrap_or(false)
         });
 
-        // Update source peer's path and promote if direct
-        if let Some(peer) = self.topology.get_peer_mut(&source) {
+        // Update source peer's path and promote if direct. A HELLO is not
+        // authenticated yet at this point (its handler verifies the MAC and
+        // records the path itself), so an unverified header must not touch
+        // peer state.
+        if let Some(peer) = self.topology.get_peer_mut(&source).filter(|_| dearmored) {
             if !is_relayed {
                 // Check if path was relay before promotion for logging
                 let was_relay = peer.paths.iter().any(|p| p.address == from && !p.is_direct);
@@ -1232,6 +1241,24 @@ impl Node {
             Err(_) => return,
         };
 
+        // The header's source must be the address of the identity the HELLO
+        // carries (ZeroTierOne node/IncomingPacket.cpp `_doHELLO` drops an
+        // "identity/address mismatch"); otherwise a valid HELLO for one
+        // identity could be replayed under another peer's address.
+        let header_source = match PacketHeader::from_bytes(data) {
+            Some(hdr) => hdr.source_address(),
+            None => return,
+        };
+        if header_source != *hello.identity.address.as_bytes() {
+            tracing::debug!(
+                target: "manytier",
+                event = "hello_source_mismatch",
+                packet_id,
+                "HELLO header source does not match the identity it carries: dropping"
+            );
+            return;
+        }
+
         // Strict HELLO MAC verification using the DH-derived shared secret.
         // The DH key agreement between x25519_dalek and official ZeroTier C25519
         // produces byte-identical shared secrets (locked by the
@@ -1344,6 +1371,7 @@ impl Node {
     /// OK(WHOIS): add learned identities to topology.
     fn handle_ok(&mut self, data: &[u8], from: SocketAddr, now_ms: u64) {
         let direct = Self::arrived_directly(data);
+        let data_header = data;
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
         let ok = match OkPayload::deserialize(payload_data) {
             Ok(o) => o,
@@ -1466,7 +1494,24 @@ impl Node {
                     // See ZeroTierOne 1.14.2 node/IncomingPacket.cpp:645-649.
                     // Official controllers return config chunks as
                     // OK(NETWORK_CONFIG_REQUEST), not only as VERB_NETWORK_CONFIG.
+                    // As for NETWORK_CONFIG, only the network's structural
+                    // controller may supply a config.
                     if let Ok(nc) = NetworkConfigPayload::deserialize(&data) {
+                        let source = match PacketHeader::from_bytes(data_header) {
+                            Some(hdr) => hdr.source_address(),
+                            None => return,
+                        };
+                        if source != controller_address_from_network_id(nc.network_id) {
+                            tracing::warn!(
+                                target: "manytier",
+                                event = "network_config_from_non_controller_rejected",
+                                network_id = %format_args!("{:016x}", nc.network_id),
+                                source = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                    source[0], source[1], source[2], source[3], source[4]),
+                                "OK(NETWORK_CONFIG_REQUEST) from a non-controller peer: dropping"
+                            );
+                            return;
+                        }
                         self.apply_received_network_config(nc);
                     }
                 }
@@ -1643,23 +1688,69 @@ impl Node {
         );
 
         // Probe pushed endpoints with HELLO; a path is recorded only when the
-        // peer answers on it.
+        // peer answers on it. A peer may only make us probe a bounded number
+        // of endpoints per window, and never ones we must not send ZeroTier
+        // traffic to (ZeroTierOne node/IncomingPacket.cpp
+        // `_doPUSH_DIRECT_PATHS`, node/Node.cpp
+        // `shouldUsePathForZeroTierTraffic`).
         let direct = Self::arrived_directly(data);
         let Some(peer) = self.topology.get_peer_mut(&source) else {
             return;
         };
+        if !peer.rate_gate_push_direct_paths(now_ms) {
+            tracing::debug!(
+                target: "manytier",
+                event = "push_direct_paths_rate_limited",
+                "ignoring PUSH_DIRECT_PATHS burst"
+            );
+            return;
+        }
         peer.add_path(from, direct, now_ms);
-        let known: Vec<SocketAddr> = peer.paths.iter().map(|path| path.address).collect();
+        let known: Vec<SocketAddr> = peer
+            .paths
+            .iter()
+            .filter(|path| path.is_alive(now_ms))
+            .map(|path| path.address)
+            .collect();
         let probes: Vec<SocketAddr> = push
             .paths
             .into_iter()
+            .filter(|path| path.flags & PUSH_DIRECT_PATHS_FLAG_FORGET_PATH == 0)
             .filter_map(|path| path.address.to_socket_addr())
             .filter(|addr| *addr != from && !known.contains(addr))
+            .filter(|addr| self.should_use_path_for_zerotier_traffic(addr))
             .take(MAX_LOCAL_ADDRESSES)
             .collect();
         for target in probes {
             self.send_probe_hello(&source, target, now_ms, "probing pushed direct path");
         }
+    }
+
+    /// Is `addr` an endpoint ZeroTier traffic may be sent to? Rejects
+    /// unspecified, loopback, multicast and link-local addresses, port 0,
+    /// and anything inside a joined network's managed address space, which
+    /// would send our own transport traffic into the virtual network.
+    fn should_use_path_for_zerotier_traffic(&self, addr: &SocketAddr) -> bool {
+        if addr.port() == 0 {
+            return false;
+        }
+        let ip = addr.ip();
+        let generic_ok = match ip {
+            IpAddr::V4(v4) => {
+                !v4.is_unspecified()
+                    && !v4.is_loopback()
+                    && !v4.is_multicast()
+                    && !v4.is_broadcast()
+                    && !v4.is_link_local()
+            }
+            IpAddr::V6(v6) => {
+                !v6.is_unspecified()
+                    && !v6.is_loopback()
+                    && !v6.is_multicast()
+                    && (v6.segments()[0] & 0xffc0) != 0xfe80
+            }
+        };
+        generic_ok && !self.networks.iter().any(|net| net.covers_ip(ip))
     }
 
     fn handle_network_config(&mut self, data: &[u8], _from: SocketAddr, _now_ms: u64) {
@@ -2301,7 +2392,11 @@ impl Node {
 
     /// Request a config refresh for an IP missing from the directory.
     pub fn note_unknown_destination(&mut self, network_id: u64, now_ms: u64) {
-        const UNKNOWN_DESTINATION_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+        // Traffic to an address the directory does not know (a scan, a
+        // stale neighbor, a member that joined since the last config) must
+        // not turn into a NETWORK_CONFIG_REQUEST per packet; one refresh
+        // per 30 s per network is ample.
+        const UNKNOWN_DESTINATION_REFRESH_MIN_INTERVAL_MS: u64 = 30_000;
         if let Some(net) = self.find_network_mut(network_id) {
             net.pending_config_request = true;
             if now_ms.saturating_sub(net.last_config_request)
@@ -5319,5 +5414,161 @@ mod tests {
             &actions[..],
             [NodeAction::SendTo { data, address }] if *address == socket && data[15] == 1
         ));
+    }
+
+    /// A non-HELLO packet whose MAC does not verify is dropped whatever its
+    /// cipher suite; suite 0 (MAC only) used to fall through to the verb
+    /// handlers.
+    #[test]
+    fn suite0_packet_with_bad_mac_is_not_dispatched() {
+        let mut rng = XorShift17_11(0x5055);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let socket: SocketAddr = "203.0.113.11:9993".parse().unwrap();
+        let peer_addr = add_active_peer(&mut node, test_identity(0x75), socket, [0x44; 48]);
+
+        // An ECHO from the peer with cipher suite 0 and a garbage MAC.
+        let mut pkt = vec![0u8; 28 + 4];
+        pkt[0..8].copy_from_slice(&77u64.to_be_bytes());
+        pkt[8..13].copy_from_slice(&our_addr);
+        pkt[13..18].copy_from_slice(&peer_addr);
+        pkt[18] = 0;
+        pkt[19..27].copy_from_slice(&[0xde; 8]);
+        pkt[27] = Verb::Echo.to_byte();
+        let actions = node.receive_packet(&mut pkt, socket, 5_000);
+        assert!(
+            actions.is_empty(),
+            "unauthenticated ECHO must not be answered, got {} actions",
+            actions.len()
+        );
+    }
+
+    /// A HELLO whose header source differs from the identity it carries is
+    /// dropped before any peer or path state is touched.
+    #[test]
+    fn hello_with_mismatched_header_source_is_dropped() {
+        let (client, controller, _shared, hello_bytes) = build_hello_verification_env(46);
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(controller, &planet, 1).unwrap();
+        let client_addr = *client.address.as_bytes();
+
+        let forged_source = [0x0f, 0x1e, 0x2d, 0x3c, 0x4b];
+        let mut forged = hello_bytes.clone();
+        forged[13..18].copy_from_slice(&forged_source);
+        let from: SocketAddr = "192.168.1.120:9993".parse().unwrap();
+        let actions = node.receive_packet(&mut forged, from, 2000);
+        assert!(actions.is_empty(), "forged HELLO must not be answered");
+        assert!(node.topology.get_peer(&client_addr).is_none());
+        assert!(node.topology.get_peer(&forged_source).is_none());
+
+        let mut genuine = hello_bytes.clone();
+        let actions = node.receive_packet(&mut genuine, from, 3000);
+        assert!(!actions.is_empty(), "the genuine HELLO is still accepted");
+        assert!(node.topology.get_peer(&client_addr).is_some());
+    }
+
+    /// Pushed endpoints are probed at most ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT
+    /// pushes per window, and never when they point into a joined network's
+    /// address space or at a loopback address.
+    #[test]
+    fn push_direct_paths_is_rate_limited_and_filters_endpoints() {
+        use zerotier_protocol::constants::ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT;
+
+        let mut rng = XorShift17_11(0x5056);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let relay_socket: SocketAddr = "203.0.113.12:9993".parse().unwrap();
+        let shared_secret = [0x12; 48];
+        let peer_addr =
+            add_active_peer(&mut node, test_identity(0x76), relay_socket, shared_secret);
+
+        let network_id = 0xff00000000abcdef_u64;
+        let mut net = NetworkMembership::new(network_id, 2800);
+        net.members.push(NetworkMember {
+            zt_address: peer_addr,
+            mac: ethernet::derive_mac(&peer_addr, network_id),
+            ipv4: Some((Ipv4Addr::new(10, 147, 20, 2), 24)),
+            ipv6: None,
+            authorized: true,
+        });
+        node.networks.push(net);
+
+        let push_with = |endpoints: &[&str], packet_id: u64| {
+            let payload = zerotier_protocol::verbs::push_direct::PushDirectPathsPayload {
+                paths: endpoints
+                    .iter()
+                    .map(
+                        |endpoint| zerotier_protocol::verbs::push_direct::DirectPath {
+                            flags: 0,
+                            address: InetAddress::from_socket_addr(endpoint.parse().unwrap()),
+                        },
+                    )
+                    .collect(),
+            };
+            let mut buf = [0u8; 256];
+            let len = payload.serialize(&mut buf);
+            crate::vl2::build_encrypted_verb_packet(
+                packet_id,
+                &peer_addr,
+                &our_addr,
+                Verb::PushDirectPaths,
+                &buf[..len],
+                &shared_secret,
+            )
+            .unwrap()
+        };
+        let hello_targets = |actions: &[NodeAction]| -> Vec<SocketAddr> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    NodeAction::SendTo { data, address }
+                        if Verb::from_byte(data[27] & 0x1f) == Some(Verb::Hello) =>
+                    {
+                        Some(*address)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Endpoints inside the joined network, loopback and port 0 are never probed.
+        let mut packet = push_with(
+            &[
+                "10.147.20.7:9993",
+                "127.0.0.1:9993",
+                "198.51.100.5:0",
+                "198.51.100.5:9993",
+            ],
+            1,
+        );
+        let actions = node.receive_packet(&mut packet, relay_socket, 5_000);
+        assert_eq!(
+            hello_targets(&actions),
+            vec!["198.51.100.5:9993".parse::<SocketAddr>().unwrap()]
+        );
+
+        // Pushes beyond the per-window limit are ignored.
+        for i in 1..ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT as u64 {
+            let target = alloc::format!("198.51.100.{}:9993", 10 + i);
+            let mut packet = push_with(&[&target], 1 + i);
+            let actions = node.receive_packet(&mut packet, relay_socket, 5_000 + i);
+            assert_eq!(
+                hello_targets(&actions).len(),
+                1,
+                "push {i} within the limit"
+            );
+        }
+        let mut packet = push_with(&["198.51.100.99:9993"], 100);
+        let actions = node.receive_packet(&mut packet, relay_socket, 5_100);
+        assert!(
+            hello_targets(&actions).is_empty(),
+            "push beyond the limit must be ignored"
+        );
     }
 }
