@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 use core::net::SocketAddr;
 
 use zerotier_crypto::salsa;
-use zerotier_protocol::constants::CIPHER_SUITE_C25519_POLY1305_SALSA2012;
+use zerotier_protocol::constants::{
+    CIPHER_SUITE_C25519_POLY1305_SALSA2012, FLAG_FRAGMENTED, ZT_DEFAULT_PHYSMTU,
+};
 use zerotier_protocol::fragment::fragment_packet;
 use zerotier_protocol::verb::Verb;
 use zerotier_protocol::verbs::frame::{ExtFramePayload, FramePayload};
@@ -43,6 +45,12 @@ pub(crate) fn build_encrypted_verb_packet(
     buf[27] = verb.to_byte();
     buf[28..28 + payload.len()].copy_from_slice(payload);
     let total_len = 28 + payload.len();
+    // A packet larger than the physical MTU goes out as a head plus
+    // fragments; the head's flag must be set before armoring since the
+    // flags byte feeds the MAC (ZeroTierOne node/Switch.cpp).
+    if total_len > ZT_DEFAULT_PHYSMTU {
+        buf[18] |= FLAG_FRAGMENTED;
+    }
 
     salsa::armor_packet(shared_secret, &mut buf[..total_len], true).ok()?;
 
@@ -414,7 +422,6 @@ pub fn process_outbound_frame(
                 if let Some(member) = network.lookup_ipv4(dest_ip) {
                     let member_address = member.zt_address;
                     let member_mac = member.mac;
-                    let mtu = network.mtu as usize;
                     let ext = ExtFramePayload {
                         network_id,
                         flags: 0,
@@ -447,7 +454,12 @@ pub fn process_outbound_frame(
                                 pkt_len = pkt.len(),
                                 "sending EXT_FRAME"
                             );
-                            push_fragmented_send(&mut actions, pkt, path_address, mtu);
+                            push_fragmented_send(
+                                &mut actions,
+                                pkt,
+                                path_address,
+                                ZT_DEFAULT_PHYSMTU,
+                            );
                         }
                     } else {
                         actions.push(NodeAction::WhoisNeeded {
@@ -469,7 +481,6 @@ pub fn process_outbound_frame(
                 if let Some(member) = network.lookup_ipv6(dest_ip) {
                     let member_address = member.zt_address;
                     let member_mac = member.mac;
-                    let mtu = network.mtu as usize;
                     let ext = ExtFramePayload {
                         network_id,
                         flags: 0,
@@ -495,7 +506,12 @@ pub fn process_outbound_frame(
                             &ext,
                             &shared_secret,
                         ) {
-                            push_fragmented_send(&mut actions, pkt, path_address, mtu);
+                            push_fragmented_send(
+                                &mut actions,
+                                pkt,
+                                path_address,
+                                ZT_DEFAULT_PHYSMTU,
+                            );
                         }
                     } else {
                         actions.push(NodeAction::WhoisNeeded {

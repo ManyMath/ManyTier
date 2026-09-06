@@ -19,6 +19,10 @@ pub const ZT_PROTO_MIN_FRAGMENT_LENGTH: usize = 16;
 /// Maximum number of fragments per packet.
 pub const ZT_MAX_PACKET_FRAGMENTS: usize = 7;
 
+/// Default physical MTU: packets larger than this are sent as a head plus
+/// fragments. See ZeroTierOne include/ZeroTierOne.h (`ZT_DEFAULT_PHYSMTU`).
+pub const ZT_DEFAULT_PHYSMTU: usize = 1432;
+
 /// Maximum relay hops.
 pub const ZT_RELAY_MAX_HOPS: u8 = 3;
 

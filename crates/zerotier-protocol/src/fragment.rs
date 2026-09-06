@@ -1,8 +1,12 @@
 //! Fragment reassembly buffer for ZeroTier V1 fragmented packets.
 //!
-//! ZeroTier fragments large packets into up to 7 pieces. The reassembly buffer
-//! collects fragments keyed by packet ID and returns the complete packet once
-//! all pieces arrive. Stale entries are evicted after a configurable timeout.
+//! ZeroTier One sends a packet larger than the physical MTU as a *head* (the
+//! first `mtu` bytes of the armored packet, with `FLAG_FRAGMENTED` set in its
+//! header) followed by up to six Fragment packets numbered 1..n-1
+//! (node/Switch.cpp `_sendViaSpecificPath`; fragment 0 is never sent, the
+//! head takes its place). The reassembly buffer collects the head and the
+//! fragments keyed by packet ID and returns the complete packet once all
+//! pieces arrive. Stale entries are evicted after a configurable timeout.
 
 extern crate alloc;
 
@@ -13,13 +17,50 @@ use crate::constants::{FRAGMENT_INDICATOR, ZT_MAX_PACKET_FRAGMENTS, ZT_PROTO_MIN
 use crate::header::PacketHeader;
 
 struct FragmentSlot {
+    head: Option<Vec<u8>>,
+    /// Index 0 is unused: fragment 0 is the head.
     fragments: [Option<Vec<u8>>; ZT_MAX_PACKET_FRAGMENTS],
+    /// Total pieces including the head; 0 until a fragment says.
     total_expected: u8,
-    received_count: u8,
+    received_fragments: u8,
     created_at: u64,
 }
 
-/// Reassembly buffer that collects packet fragments and returns complete packets.
+impl FragmentSlot {
+    fn new(now_ms: u64) -> Self {
+        const NONE: Option<Vec<u8>> = None;
+        FragmentSlot {
+            head: None,
+            fragments: [NONE; ZT_MAX_PACKET_FRAGMENTS],
+            total_expected: 0,
+            received_fragments: 0,
+            created_at: now_ms,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.head.is_some()
+            && self.total_expected > 1
+            && self.received_fragments + 1 >= self.total_expected
+    }
+
+    fn assemble(self) -> Vec<u8> {
+        let mut assembled = self.head.unwrap_or_default();
+        for data in self
+            .fragments
+            .iter()
+            .take(self.total_expected as usize)
+            .skip(1)
+            .flatten()
+        {
+            assembled.extend_from_slice(data);
+        }
+        assembled
+    }
+}
+
+/// Reassembly buffer that collects packet heads and fragments and returns
+/// complete packets.
 pub struct ReassemblyBuffer {
     pending: BTreeMap<u64, FragmentSlot>,
     max_pending: usize,
@@ -34,28 +75,7 @@ impl ReassemblyBuffer {
         }
     }
 
-    /// Insert a fragment. Returns the reassembled packet if all fragments have arrived.
-    ///
-    /// `packet_id`: identifies which packet this fragment belongs to.
-    /// `fragment_number`: 0-based index of this fragment.
-    /// `total_fragments`: total number of fragments for this packet.
-    /// `data`: the fragment payload bytes.
-    /// `now_ms`: current monotonic time in milliseconds.
-    pub fn insert(
-        &mut self,
-        packet_id: u64,
-        fragment_number: u8,
-        total_fragments: u8,
-        data: Vec<u8>,
-        now_ms: u64,
-    ) -> Option<Vec<u8>> {
-        if total_fragments == 0
-            || total_fragments as usize > ZT_MAX_PACKET_FRAGMENTS
-            || fragment_number >= total_fragments
-        {
-            return None;
-        }
-
+    fn slot(&mut self, packet_id: u64, now_ms: u64) -> &mut FragmentSlot {
         // Evict oldest if at capacity
         if !self.pending.contains_key(&packet_id) && self.pending.len() >= self.max_pending {
             let oldest_id = self
@@ -67,35 +87,69 @@ impl ReassemblyBuffer {
                 self.pending.remove(&id);
             }
         }
+        self.pending
+            .entry(packet_id)
+            .or_insert_with(|| FragmentSlot::new(now_ms))
+    }
 
-        let slot = self.pending.entry(packet_id).or_insert_with(|| {
-            const NONE: Option<Vec<u8>> = None;
-            FragmentSlot {
-                fragments: [NONE; ZT_MAX_PACKET_FRAGMENTS],
-                total_expected: total_fragments,
-                received_count: 0,
-                created_at: now_ms,
-            }
-        });
+    fn complete(&mut self, packet_id: u64) -> Option<Vec<u8>> {
+        if self.pending.get(&packet_id)?.is_complete() {
+            self.pending.remove(&packet_id).map(FragmentSlot::assemble)
+        } else {
+            None
+        }
+    }
+
+    /// Insert the head of a fragmented packet (the packet whose header has
+    /// `FLAG_FRAGMENTED` set). Returns the reassembled packet if every
+    /// fragment has already arrived.
+    pub fn insert_head(&mut self, packet_id: u64, head: Vec<u8>, now_ms: u64) -> Option<Vec<u8>> {
+        let slot = self.slot(packet_id, now_ms);
+        if slot.head.is_none() {
+            slot.head = Some(head);
+        }
+        self.complete(packet_id)
+    }
+
+    /// Insert a fragment. Returns the reassembled packet if the head and all
+    /// other fragments have arrived.
+    ///
+    /// `packet_id`: identifies which packet this fragment belongs to.
+    /// `fragment_number`: 1-based index of this fragment (0 is the head and
+    /// is rejected, as upstream does).
+    /// `total_fragments`: total number of pieces including the head.
+    /// `data`: the fragment payload bytes.
+    /// `now_ms`: current monotonic time in milliseconds.
+    pub fn insert(
+        &mut self,
+        packet_id: u64,
+        fragment_number: u8,
+        total_fragments: u8,
+        data: Vec<u8>,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        if total_fragments < 2
+            || total_fragments as usize > ZT_MAX_PACKET_FRAGMENTS
+            || fragment_number == 0
+            || fragment_number >= total_fragments
+        {
+            return None;
+        }
+
+        let slot = self.slot(packet_id, now_ms);
+        if slot.total_expected == 0 {
+            slot.total_expected = total_fragments;
+        } else if slot.total_expected != total_fragments {
+            return None; // disagrees with the fragments already held
+        }
 
         let idx = fragment_number as usize;
         if slot.fragments[idx].is_none() {
             slot.fragments[idx] = Some(data);
-            slot.received_count += 1;
+            slot.received_fragments += 1;
         }
 
-        if slot.received_count >= slot.total_expected {
-            let slot = self.pending.remove(&packet_id).unwrap();
-            let mut assembled = Vec::new();
-            for i in 0..slot.total_expected as usize {
-                if let Some(frag_data) = &slot.fragments[i] {
-                    assembled.extend_from_slice(frag_data);
-                }
-            }
-            Some(assembled)
-        } else {
-            None
-        }
+        self.complete(packet_id)
     }
 
     /// Evict stale entries older than `timeout_ms`.
@@ -105,10 +159,15 @@ impl ReassemblyBuffer {
     }
 }
 
-/// Split a full ZeroTier packet into fragment packets that fit within `mtu`.
+/// Split an armored ZeroTier packet into the pieces that fit within `mtu`:
+/// the head (the first `mtu` bytes, sent as an ordinary packet) followed by
+/// Fragment packets numbered 1..n-1, matching ZeroTierOne node/Switch.cpp
+/// `_sendViaSpecificPath`. Fragments carry hop count 0 like upstream's
+/// `Packet::Fragment::init`.
 ///
-/// The fragment payloads are contiguous slices of the original packet bytes, so
-/// successful reassembly reconstructs the original packet verbatim.
+/// A packet that fits is returned as is. The caller must have set
+/// `FLAG_FRAGMENTED` in the header *before* armoring a packet that needs
+/// splitting, since the flags byte feeds the MAC.
 pub fn fragment_packet(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
     if packet.len() <= mtu {
         return Some(alloc::vec![packet.to_vec()]);
@@ -118,37 +177,36 @@ pub fn fragment_packet(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
     }
 
     let header = PacketHeader::from_bytes(packet)?;
-    let max_payload = mtu - ZT_PROTO_MIN_FRAGMENT_LENGTH;
-    if max_payload == 0 {
-        return None;
-    }
-
-    let total_fragments = packet.len().div_ceil(max_payload);
-    if total_fragments == 0 || total_fragments > ZT_MAX_PACKET_FRAGMENTS {
+    let fragment_payload = mtu - ZT_PROTO_MIN_FRAGMENT_LENGTH;
+    let remaining = packet.len() - mtu;
+    let fragment_count = remaining.div_ceil(fragment_payload);
+    let total = fragment_count + 1;
+    if total > ZT_MAX_PACKET_FRAGMENTS {
         return None;
     }
 
     let packet_id = header.packet_id();
     let dest = header.dest_address();
-    let hops = header.hops();
 
-    let mut fragments = Vec::with_capacity(total_fragments);
-    for fragment_number in 0..total_fragments {
-        let start = fragment_number * max_payload;
-        let end = core::cmp::min(start + max_payload, packet.len());
+    let mut pieces = Vec::with_capacity(total);
+    pieces.push(packet[..mtu].to_vec());
+    let mut start = mtu;
+    for fragment_number in 1..total {
+        let end = core::cmp::min(start + fragment_payload, packet.len());
         let payload = &packet[start..end];
 
         let mut fragment = Vec::with_capacity(ZT_PROTO_MIN_FRAGMENT_LENGTH + payload.len());
         fragment.extend_from_slice(&packet_id.to_be_bytes());
         fragment.extend_from_slice(&dest);
         fragment.push(FRAGMENT_INDICATOR);
-        fragment.push(((total_fragments as u8) << 4) | fragment_number as u8);
-        fragment.push(hops);
+        fragment.push(((total as u8) << 4) | fragment_number as u8);
+        fragment.push(0); // hops
         fragment.extend_from_slice(payload);
-        fragments.push(fragment);
+        pieces.push(fragment);
+        start = end;
     }
 
-    Some(fragments)
+    Some(pieces)
 }
 
 #[cfg(test)]
@@ -157,36 +215,26 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn single_fragment_returns_immediately() {
+    fn head_then_fragment_in_order() {
         let mut buf = ReassemblyBuffer::new(256);
-        let result = buf.insert(1, 0, 1, vec![0x01, 0x02, 0x03], 100);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03]);
-    }
-
-    #[test]
-    fn two_fragments_in_order() {
-        let mut buf = ReassemblyBuffer::new(256);
-        assert!(buf.insert(1, 0, 2, vec![0x01, 0x02], 100).is_none());
+        assert!(buf.insert_head(1, vec![0x01, 0x02], 100).is_none());
         let result = buf.insert(1, 1, 2, vec![0x03, 0x04], 100);
-        assert!(result.is_some());
         assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03, 0x04]);
     }
 
     #[test]
-    fn two_fragments_out_of_order() {
+    fn fragments_before_head() {
         let mut buf = ReassemblyBuffer::new(256);
-        assert!(buf.insert(1, 1, 2, vec![0x03, 0x04], 100).is_none());
-        let result = buf.insert(1, 0, 2, vec![0x01, 0x02], 100);
-        assert!(result.is_some());
-        // Should be reassembled in order regardless of arrival order
-        assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03, 0x04]);
+        assert!(buf.insert(1, 2, 3, vec![0x05], 100).is_none());
+        assert!(buf.insert(1, 1, 3, vec![0x03, 0x04], 100).is_none());
+        let result = buf.insert_head(1, vec![0x01, 0x02], 100);
+        assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03, 0x04, 0x05]);
     }
 
     #[test]
     fn returns_none_until_all_arrive() {
         let mut buf = ReassemblyBuffer::new(256);
-        assert!(buf.insert(1, 0, 3, vec![0x01], 100).is_none());
+        assert!(buf.insert_head(1, vec![0x01], 100).is_none());
         assert!(buf.insert(1, 2, 3, vec![0x03], 100).is_none());
         let result = buf.insert(1, 1, 3, vec![0x02], 100);
         assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03]);
@@ -195,130 +243,107 @@ mod tests {
     #[test]
     fn duplicate_fragment_ignored() {
         let mut buf = ReassemblyBuffer::new(256);
+        assert!(buf.insert(1, 1, 3, vec![0x02], 100).is_none());
+        assert!(buf.insert(1, 1, 3, vec![0xFF], 100).is_none());
+        assert!(buf.insert_head(1, vec![0x01], 100).is_none());
+        let result = buf.insert(1, 2, 3, vec![0x03], 100);
+        assert_eq!(result.unwrap(), vec![0x01, 0x02, 0x03]);
+    }
+
+    /// Fragment 0 is the head and never arrives as a Fragment packet
+    /// (ZeroTierOne node/Switch.cpp requires `fragmentNumber > 0`).
+    #[test]
+    fn fragment_zero_and_single_piece_series_are_rejected() {
+        let mut buf = ReassemblyBuffer::new(256);
         assert!(buf.insert(1, 0, 2, vec![0x01], 100).is_none());
-        // Send fragment 0 again -- should be ignored
-        assert!(buf.insert(1, 0, 2, vec![0xFF], 100).is_none());
-        let result = buf.insert(1, 1, 2, vec![0x02], 100);
-        // Should use the first fragment 0
-        assert_eq!(result.unwrap(), vec![0x01, 0x02]);
-    }
-
-    #[test]
-    fn evict_stale_entries() {
-        let mut buf = ReassemblyBuffer::new(256);
-        buf.insert(1, 0, 2, vec![0x01], 100);
-        buf.insert(2, 0, 2, vec![0x02], 200);
-        buf.evict_stale(350, 200);
-        // packet 1 (created at 100) should be evicted (350 - 100 = 250 >= 200)
-        // packet 2 (created at 200) should remain (350 - 200 = 150 < 200)
-        assert!(buf.insert(1, 1, 2, vec![0x03], 350).is_none()); // slot gone, starts fresh
-        assert!(buf.insert(2, 1, 2, vec![0x04], 350).is_some()); // completes
-    }
-
-    #[test]
-    fn max_pending_evicts_oldest() {
-        let mut buf = ReassemblyBuffer::new(2);
-        buf.insert(1, 0, 2, vec![0x01], 100);
-        buf.insert(2, 0, 2, vec![0x02], 200);
-        // Buffer is full (2 entries). Inserting new packet evicts oldest (packet 1)
-        buf.insert(3, 0, 2, vec![0x03], 300);
-        // Packet 1 was evicted, packet 2 and 3 remain
-        // Complete packet 3
-        assert!(buf.insert(3, 1, 2, vec![0x04], 300).is_some());
-        // Packet 2 should still work
-        assert!(buf.insert(2, 1, 2, vec![0x05], 300).is_some());
-    }
-
-    #[test]
-    fn rejects_invalid_fragment_number() {
-        let mut buf = ReassemblyBuffer::new(256);
-        // fragment_number >= total_fragments
+        assert!(buf.insert(1, 1, 1, vec![0x01], 100).is_none());
         assert!(buf.insert(1, 2, 2, vec![0x01], 100).is_none());
+        assert!(buf.pending.is_empty());
     }
 
     #[test]
-    fn rejects_zero_total() {
+    fn total_mismatch_is_ignored() {
         let mut buf = ReassemblyBuffer::new(256);
-        assert!(buf.insert(1, 0, 0, vec![0x01], 100).is_none());
+        assert!(buf.insert(1, 1, 3, vec![0x02], 100).is_none());
+        assert!(buf.insert(1, 1, 2, vec![0x02], 100).is_none());
+        assert!(buf.insert_head(1, vec![0x01], 100).is_none());
+        assert_eq!(buf.pending.len(), 1);
     }
 
     #[test]
-    fn seven_fragments() {
+    fn evicts_stale_entries() {
         let mut buf = ReassemblyBuffer::new(256);
-        for i in 0..6 {
-            assert!(buf.insert(1, i, 7, vec![i], 100).is_none());
-        }
-        let result = buf.insert(1, 6, 7, vec![6], 100);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), vec![0, 1, 2, 3, 4, 5, 6]);
+        buf.insert(1, 1, 2, vec![0x01], 100);
+        buf.insert(2, 1, 2, vec![0x01], 5000);
+        buf.evict_stale(6000, 2000);
+        assert!(buf.insert_head(1, vec![0x00], 6000).is_none());
+        assert_eq!(
+            buf.insert_head(2, vec![0x00], 6000).unwrap(),
+            vec![0x00, 0x01]
+        );
     }
 
     #[test]
-    fn separate_packet_ids() {
-        let mut buf = ReassemblyBuffer::new(256);
-        buf.insert(1, 0, 2, vec![0x01], 100);
-        buf.insert(2, 0, 2, vec![0x0A], 100);
-        let r1 = buf.insert(1, 1, 2, vec![0x02], 100);
-        let r2 = buf.insert(2, 1, 2, vec![0x0B], 100);
-        assert_eq!(r1.unwrap(), vec![0x01, 0x02]);
-        assert_eq!(r2.unwrap(), vec![0x0A, 0x0B]);
+    fn evicts_oldest_at_capacity() {
+        let mut buf = ReassemblyBuffer::new(2);
+        buf.insert(1, 1, 2, vec![0x01], 100);
+        buf.insert(2, 1, 2, vec![0x02], 200);
+        buf.insert(3, 1, 2, vec![0x03], 300);
+        assert!(!buf.pending.contains_key(&1));
+        assert!(buf.pending.contains_key(&2));
+        assert!(buf.pending.contains_key(&3));
     }
 
-    fn make_packet(payload_len: usize) -> Vec<u8> {
-        let mut packet = vec![0u8; 28 + payload_len];
-        packet[0..8].copy_from_slice(&0x1122334455667788u64.to_be_bytes());
+    fn armored_looking_packet(len: usize) -> Vec<u8> {
+        let mut packet = vec![0u8; len];
+        packet[0..8].copy_from_slice(&0x0102030405060708u64.to_be_bytes());
         packet[8..13].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
-        packet[13..18].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]);
-        packet[18] = 0b0000_0011; // hops=3
-        packet[27] = 0x07; // EXT_FRAME
-        for (i, byte) in packet[28..].iter_mut().enumerate() {
-            *byte = (i & 0xff) as u8;
+        packet[13..18].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
+        packet[18] = 0x48; // cipher suite 1, FLAG_FRAGMENTED
+        for (i, b) in packet.iter_mut().enumerate().skip(28) {
+            *b = i as u8;
         }
         packet
     }
 
     #[test]
-    fn fragment_packet_returns_original_when_under_mtu() {
-        let packet = make_packet(32);
-        let fragments = fragment_packet(&packet, 128).unwrap();
-        assert_eq!(fragments.len(), 1);
-        assert_eq!(fragments[0], packet);
+    fn small_packet_is_not_fragmented() {
+        let packet = armored_looking_packet(100);
+        let pieces = fragment_packet(&packet, 1432).unwrap();
+        assert_eq!(pieces, vec![packet]);
     }
 
+    /// Head is the first `mtu` bytes verbatim; fragments are numbered from
+    /// 1 with the total in the high nibble and hop count 0.
     #[test]
-    fn fragment_packet_splits_and_sets_headers() {
-        let packet = make_packet(64);
-        let fragments = fragment_packet(&packet, 40).unwrap();
-        assert_eq!(fragments.len(), 4);
-
-        for (idx, fragment) in fragments.iter().enumerate() {
-            assert_eq!(&fragment[0..8], &0x1122334455667788u64.to_be_bytes());
-            assert_eq!(&fragment[8..13], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+    fn fragment_packet_emits_head_and_numbered_fragments() {
+        let packet = armored_looking_packet(3000);
+        let mtu = 1432;
+        let pieces = fragment_packet(&packet, mtu).unwrap();
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces[0], packet[..mtu].to_vec());
+        for (n, fragment) in pieces.iter().enumerate().skip(1) {
+            assert_eq!(&fragment[0..8], &packet[0..8]);
+            assert_eq!(&fragment[8..13], &packet[8..13]);
             assert_eq!(fragment[13], FRAGMENT_INDICATOR);
-            assert_eq!(fragment[14] >> 4, 4);
-            assert_eq!(fragment[14] & 0x0f, idx as u8);
-            assert_eq!(fragment[15], 3);
-            assert!(fragment.len() <= 40);
+            assert_eq!(fragment[14], (3 << 4) | n as u8);
+            assert_eq!(fragment[15], 0);
+            assert!(fragment.len() <= mtu);
         }
+        assert_eq!(pieces[1].len(), mtu);
+
+        let mut buf = ReassemblyBuffer::new(4);
+        let mut result = buf.insert(0x0102030405060708, 2, 3, pieces[2][16..].to_vec(), 0);
+        assert!(result.is_none());
+        result = buf.insert_head(0x0102030405060708, pieces[0].clone(), 0);
+        assert!(result.is_none());
+        result = buf.insert(0x0102030405060708, 1, 3, pieces[1][16..].to_vec(), 0);
+        assert_eq!(result.unwrap(), packet);
     }
 
     #[test]
-    fn fragment_packet_roundtrips_through_reassembly() {
-        let packet = make_packet(96);
-        let fragments = fragment_packet(&packet, 48).unwrap();
-        let mut reassembly = ReassemblyBuffer::new(8);
-        let mut reassembled = None;
-
-        for fragment in fragments.into_iter().rev() {
-            reassembled = reassembly.insert(
-                0x1122334455667788,
-                fragment[14] & 0x0f,
-                fragment[14] >> 4,
-                fragment[16..].to_vec(),
-                100,
-            );
-        }
-
-        assert_eq!(reassembled.unwrap(), packet);
+    fn fragment_packet_rejects_too_many_pieces() {
+        let packet = armored_looking_packet(20_000);
+        assert!(fragment_packet(&packet, 1432).is_none());
     }
 }

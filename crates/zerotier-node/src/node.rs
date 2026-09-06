@@ -798,6 +798,29 @@ impl Node {
             return core::mem::take(&mut self.actions);
         }
 
+        // The head of a fragmented series addressed to us is held until the
+        // fragments arrive (ZeroTierOne node/Switch.cpp); a head in transit
+        // for someone else is relayed like any other packet.
+        let head = PacketHeader::from_bytes(data)
+            .filter(|hdr| hdr.is_fragmented() && hdr.dest == *self.identity.address.as_bytes())
+            .map(|hdr| hdr.packet_id());
+        if let Some(packet_id) = head {
+            if let Some(mut assembled) =
+                self.reassembly
+                    .insert_head(packet_id, data.to_vec(), now_ms)
+            {
+                self.process_whole_packet(&mut assembled, from, now_ms);
+            }
+            return core::mem::take(&mut self.actions);
+        }
+
+        self.process_whole_packet(data, from, now_ms);
+        core::mem::take(&mut self.actions)
+    }
+
+    /// Process a complete (unfragmented or reassembled) packet, pushing the
+    /// resulting actions onto `self.actions`.
+    fn process_whole_packet(&mut self, data: &mut [u8], from: SocketAddr, now_ms: u64) {
         // Parse header (read-only) to get routing info
         let dest;
         let source;
@@ -807,7 +830,7 @@ impl Node {
         {
             let hdr = match PacketHeader::from_bytes(data) {
                 Some(h) => h,
-                None => return core::mem::take(&mut self.actions),
+                None => return,
             };
             dest = hdr.dest;
             source = hdr.source_address();
@@ -819,7 +842,7 @@ impl Node {
         // Check if destined for us
         if dest != *self.identity.address.as_bytes() {
             self.handle_relay(data, now_ms);
-            return core::mem::take(&mut self.actions);
+            return;
         }
 
         // Dearmor packet (verify MAC, optionally decrypt)
@@ -861,7 +884,7 @@ impl Node {
                     packet_len = data.len(),
                     "packet dearmor failed: dropping"
                 );
-                return core::mem::take(&mut self.actions);
+                return;
             }
         }
 
@@ -881,7 +904,7 @@ impl Node {
                             packet_len = data.len(),
                             "compressed packet decompression failed: dropping"
                         );
-                        return core::mem::take(&mut self.actions);
+                        return;
                     }
                 }
             } else {
@@ -1160,8 +1183,6 @@ impl Node {
                 );
             }
         }
-
-        core::mem::take(&mut self.actions)
     }
 
     /// Attempt to dearmor (verify MAC + decrypt) a packet.
@@ -2069,6 +2090,11 @@ impl Node {
             None => return,
         };
 
+        if frag_hdr.dest != *self.identity.address.as_bytes() {
+            self.relay_fragment(data, frag_hdr.dest, now_ms);
+            return;
+        }
+
         let packet_id = frag_hdr.packet_id_u64();
         let fragment_number = frag_hdr.fragment_number();
         let total_fragments = frag_hdr.total_fragments();
@@ -2087,10 +2113,34 @@ impl Node {
             fragment_data,
             now_ms,
         ) {
-            // Recursively process the reassembled packet
             let mut assembled = assembled;
-            let actions = self.receive_packet(&mut assembled, from, now_ms);
-            self.actions.extend(actions);
+            self.process_whole_packet(&mut assembled, from, now_ms);
+        }
+    }
+
+    /// Forward a fragment addressed to another node, like the head of its
+    /// series (ZeroTierOne node/Switch.cpp relays fragments the same way).
+    fn relay_fragment(&mut self, data: &[u8], dest: [u8; 5], now_ms: u64) {
+        let mut fragment = data.to_vec();
+        let hops = fragment[15];
+        if hops >= zerotier_protocol::constants::ZT_RELAY_MAX_HOPS {
+            return;
+        }
+        fragment[15] = hops + 1;
+        match Switch::route(&self.topology, &dest, now_ms) {
+            RouteDecision::Direct { address } => {
+                self.actions.push(NodeAction::SendTo {
+                    data: fragment,
+                    address,
+                });
+            }
+            RouteDecision::Relay { root_address, .. } => {
+                self.actions.push(NodeAction::SendTo {
+                    data: fragment,
+                    address: root_address,
+                });
+            }
+            RouteDecision::Drop => {}
         }
     }
 
@@ -5188,5 +5238,86 @@ mod tests {
         assert_eq!(net.peer_coms.len(), 1);
         assert_eq!(net.peer_coms[0].0, sender);
         assert_eq!(net.peer_coms[0].1, sender_com);
+    }
+
+    /// A packet larger than the physical MTU arrives as a head (with
+    /// FLAG_FRAGMENTED) plus Fragment packets numbered from 1, in any order,
+    /// and is processed once complete.
+    #[test]
+    fn fragmented_echo_is_reassembled_from_head_and_fragments() {
+        use zerotier_protocol::constants::ZT_DEFAULT_PHYSMTU;
+        use zerotier_protocol::fragment::fragment_packet;
+
+        let mut rng = XorShift17_11(0x4652);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let socket: SocketAddr = "203.0.113.9:9993".parse().unwrap();
+        let shared_secret = [0x22; 48];
+        let peer_addr = add_active_peer(&mut node, test_identity(0x73), socket, shared_secret);
+
+        let echo_payload = vec![0xa5u8; 2_000];
+        let packet = crate::vl2::build_encrypted_verb_packet(
+            0x0a0b_0c0d_0e0f_1011,
+            &peer_addr,
+            &our_addr,
+            Verb::Echo,
+            &echo_payload,
+            &shared_secret,
+        )
+        .unwrap();
+        assert!(PacketHeader::from_bytes(&packet).unwrap().is_fragmented());
+
+        let pieces = fragment_packet(&packet, ZT_DEFAULT_PHYSMTU).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!(!is_fragment(&pieces[0]));
+        assert!(is_fragment(&pieces[1]));
+
+        // Fragment first, head last.
+        let mut piece = pieces[1].clone();
+        assert!(node.receive_packet(&mut piece, socket, 5_000).is_empty());
+        let mut piece = pieces[0].clone();
+        let actions = node.receive_packet(&mut piece, socket, 5_000);
+        let replied = actions.iter().any(|action| match action {
+            NodeAction::SendTo { data, address } if *address == socket => {
+                let mut reply = data.clone();
+                salsa::dearmor_packet(&shared_secret, &mut reply).is_ok()
+                    && Verb::from_byte(reply[27] & 0x1f) == Some(Verb::Ok)
+            }
+            _ => false,
+        });
+        assert!(
+            replied,
+            "reassembled ECHO must be answered with OK, got {} actions",
+            actions.len()
+        );
+    }
+
+    /// A fragment addressed to another node is forwarded with its hop count
+    /// incremented rather than buffered here.
+    #[test]
+    fn fragments_for_other_destinations_are_relayed() {
+        let mut rng = XorShift17_11(0x4653);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+
+        let socket: SocketAddr = "203.0.113.10:9993".parse().unwrap();
+        let dest = add_active_peer(&mut node, test_identity(0x74), socket, [0x33; 48]);
+
+        let mut fragment = vec![0u8; 40];
+        fragment[0..8].copy_from_slice(&7u64.to_be_bytes());
+        fragment[8..13].copy_from_slice(&dest);
+        fragment[13] = 0xff;
+        fragment[14] = (2 << 4) | 1;
+        fragment[15] = 0;
+        let actions =
+            node.receive_packet(&mut fragment, "198.51.100.4:9993".parse().unwrap(), 5_000);
+        assert!(matches!(
+            &actions[..],
+            [NodeAction::SendTo { data, address }] if *address == socket && data[15] == 1
+        ));
     }
 }
