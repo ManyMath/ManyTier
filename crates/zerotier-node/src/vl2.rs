@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn outbound_frame_to_unknown_member_requests_config_refresh() {
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
         let our_addr = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4];
         let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
         {
@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn ext_frame_with_valid_com_produces_frame_received() {
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
         let sender = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
         let our_addr = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4];
         let our_mac = ethernet::derive_mac(&our_addr, network_id);
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn ext_frame_without_com_is_rejected() {
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
         let sender = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
 
         let (node, _signing_key, _controller_address) = make_node_with_com(network_id);
@@ -811,7 +811,7 @@ mod tests {
     fn multicast_like_records_subscriptions() {
         let mut mgr = MulticastManager::new();
         let sender = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
 
         // Build MULTICAST_LIKE payload
         let like = MulticastLikePayload {
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn multicast_gather_returns_subscribers() {
         let mut mgr = MulticastManager::new();
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
         let peer1 = [0x01, 0x02, 0x03, 0x04, 0x05];
         let peer2 = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
 
@@ -851,7 +851,7 @@ mod tests {
 
     #[test]
     fn arp_outbound_resolved_locally() {
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
         let our_addr = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4];
         let peer_addr = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
         let peer_mac = ethernet::derive_mac(&peer_addr, network_id);
@@ -892,7 +892,7 @@ mod tests {
         let peer_id = test_identity(0x42);
         let peer_address = *peer_id.address.as_bytes();
         let our_address = *node.identity.address.as_bytes();
-        let network_id = 0xff00000000abcdef_u64;
+        let network_id = 0xfe00000000abcdef_u64;
 
         node.topology.add_peer(peer_id);
         let peer = node.topology.get_peer_mut(&peer_address).unwrap();

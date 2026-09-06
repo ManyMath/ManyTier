@@ -98,18 +98,15 @@ pub fn compute_memory_hard_hash(public_key: &[u8; 64]) -> [u8; 64] {
 ///
 /// Returns `None` if:
 /// - The hashcash PoW is not satisfied (digest[0] >= 17)
-/// - The derived address is reserved (all zeros or all ones)
+/// - The derived address is reserved (all zeros or 0xff-prefixed)
 pub fn derive_address(digest: &[u8; 64]) -> Option<[u8; 5]> {
     if digest[0] >= HASHCASH_THRESHOLD {
         return None; // PoW not satisfied
     }
     let mut addr = [0u8; 5];
     addr.copy_from_slice(&digest[59..64]);
-    // Reject reserved addresses
-    if addr == [0x00, 0x00, 0x00, 0x00, 0x00] {
-        return None;
-    }
-    if addr == [0xff, 0xff, 0xff, 0xff, 0xff] {
+    // Reject reserved addresses (all zeros or the 0xff fragment prefix)
+    if crate::identity::Address::is_reserved(addr) {
         return None;
     }
     Some(addr)

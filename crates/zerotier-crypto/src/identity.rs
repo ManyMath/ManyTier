@@ -21,15 +21,21 @@ pub struct Address([u8; 5]);
 impl Address {
     /// Create a new Address from raw bytes.
     ///
-    /// Returns an error if the address is reserved (all zeros or all ones).
+    /// Returns an error if the address is reserved: all zeros, or any
+    /// address whose first byte is 0xff. The first source-address byte sits
+    /// at packet offset 13, where 0xff marks a fragment, so ZeroTier One
+    /// reserves the whole 0xff prefix (node/Address.hpp `isReserved`,
+    /// `ZT_ADDRESS_RESERVED_PREFIX`).
     pub fn new(bytes: [u8; 5]) -> Result<Self, CryptoError> {
-        if bytes == [0x00, 0x00, 0x00, 0x00, 0x00] {
-            return Err(CryptoError::InvalidAddress);
-        }
-        if bytes == [0xff, 0xff, 0xff, 0xff, 0xff] {
+        if Self::is_reserved(bytes) {
             return Err(CryptoError::InvalidAddress);
         }
         Ok(Address(bytes))
+    }
+
+    /// Is this a reserved address (all zeros or 0xff-prefixed)?
+    pub fn is_reserved(bytes: [u8; 5]) -> bool {
+        bytes == [0x00; 5] || bytes[0] == 0xff
     }
 
     /// Parse a 10-character lowercase hex string into an Address.
@@ -337,7 +343,7 @@ mod tests {
     #[test]
     fn address_accepts_valid() {
         assert!(Address::new([0x01, 0x00, 0x00, 0x00, 0x00]).is_ok());
-        assert!(Address::new([0xff, 0xff, 0xff, 0xff, 0xfe]).is_ok());
+        assert!(Address::new([0xfe, 0xff, 0xff, 0xff, 0xff]).is_ok());
     }
 
     // --- PublicKey tests ---
@@ -587,5 +593,14 @@ mod tests {
             self.fill_bytes(dest);
             Ok(())
         }
+    }
+
+    #[test]
+    fn address_new_rejects_reserved_prefix() {
+        assert!(Address::new([0x00; 5]).is_err());
+        assert!(Address::new([0xff; 5]).is_err());
+        // Any 0xff-prefixed address is reserved, not only all ones.
+        assert!(Address::new([0xff, 0x01, 0x02, 0x03, 0x04]).is_err());
+        assert!(Address::new([0xfe, 0xff, 0xff, 0xff, 0xff]).is_ok());
     }
 }
