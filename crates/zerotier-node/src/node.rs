@@ -465,16 +465,23 @@ impl Node {
         };
         let pending = self.pending_multicast_gathers.swap_remove(pending_index);
 
-        if data.len() < 4 {
+        // OK(MULTICAST_GATHER) payload (ZeroTierOne node/Packet.hpp,
+        // node/Multicaster.cpp gather): network id (8), group MAC (6),
+        // ADI (4), total known (u32), count (u16), then 5-byte addresses.
+        if data.len() < 24 {
+            return;
+        }
+        let network_id = u64::from_be_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+        let adi = u32::from_be_bytes([data[14], data[15], data[16], data[17]]);
+        if network_id != pending.network_id || data[8..14] != pending.mac || adi != pending.adi {
+            return;
+        }
+        let count = u16::from_be_bytes([data[22], data[23]]) as usize;
+        if data.len() < 24 + count * 5 {
             return;
         }
 
-        let count = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if data.len() < 4 + count * 5 {
-            return;
-        }
-
-        for chunk in data[4..4 + count * 5].chunks_exact(5) {
+        for chunk in data[24..24 + count * 5].chunks_exact(5) {
             let mut subscriber = [0u8; 5];
             subscriber.copy_from_slice(chunk);
             self.multicast_manager.subscribe(
@@ -5570,5 +5577,53 @@ mod tests {
             hello_targets(&actions).is_empty(),
             "push beyond the limit must be ignored"
         );
+    }
+
+    /// OK(MULTICAST_GATHER) from an official node is parsed in the upstream
+    /// layout and its addresses become subscribers of the gathered group;
+    /// a reply for a different group than the one requested is ignored.
+    #[test]
+    fn multicast_gather_ok_parses_upstream_layout() {
+        let id = test_identity(0x01);
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let network_id = 0xfe00000000abcdef_u64;
+        let group_mac = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
+        let adi = 0x1234_5678u32;
+        node.pending_multicast_gathers.push(PendingMulticastGather {
+            packet_id: 42,
+            requested_at_ms: 1000,
+            network_id,
+            mac: group_mac,
+            adi,
+        });
+
+        let member = [0x2a, 0x2b, 0x2c, 0x2d, 0x2e];
+        let mut body = Vec::new();
+        body.extend_from_slice(&network_id.to_be_bytes());
+        body.extend_from_slice(&group_mac);
+        body.extend_from_slice(&adi.to_be_bytes());
+        body.extend_from_slice(&5u32.to_be_bytes()); // total known
+        body.extend_from_slice(&1u16.to_be_bytes()); // gathered
+        body.extend_from_slice(&member);
+        node.handle_multicast_gather_ok(42, &body, 2000);
+        assert_eq!(
+            node.multicast_manager
+                .get_subscribers(network_id, &group_mac, adi, 10),
+            vec![member]
+        );
+
+        node.pending_multicast_gathers.push(PendingMulticastGather {
+            packet_id: 43,
+            requested_at_ms: 1000,
+            network_id,
+            mac: group_mac,
+            adi: adi + 1,
+        });
+        node.handle_multicast_gather_ok(43, &body, 2000);
+        assert!(node
+            .multicast_manager
+            .get_subscribers(network_id, &group_mac, adi + 1, 10)
+            .is_empty());
     }
 }

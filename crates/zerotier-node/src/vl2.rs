@@ -236,11 +236,27 @@ pub fn handle_multicast_gather(
         node.multicast_manager
             .get_subscribers(gather.network_id, &gather.mac, gather.adi, limit);
 
-    // Build OK(MULTICAST_GATHER) response with subscriber list.
-    // Wire format: count(u32 BE) + repeated 5-byte ZT addresses.
-    let count = subscribers.len() as u32;
-    let response_len = 4 + subscribers.len() * 5;
+    // Upstream sends no OK when nothing was gathered (ZeroTierOne
+    // node/IncomingPacket.cpp _doMULTICAST_GATHER).
+    if subscribers.is_empty() {
+        return;
+    }
+
+    // Build OK(MULTICAST_GATHER) response with subscriber list. Wire format
+    // after the OK in-re header (node/Packet.hpp VERB_MULTICAST_GATHER,
+    // node/Multicaster.cpp gather): network id (8), group MAC (6), ADI (4),
+    // total known members (u32), gathered count (u16), 5-byte addresses.
+    let total_known = node
+        .multicast_manager
+        .get_subscribers(gather.network_id, &gather.mac, gather.adi, usize::MAX)
+        .len() as u32;
+    let count = subscribers.len() as u16;
+    let response_len = 24 + subscribers.len() * 5;
     let mut response = Vec::with_capacity(response_len);
+    response.extend_from_slice(&gather.network_id.to_be_bytes());
+    response.extend_from_slice(&gather.mac);
+    response.extend_from_slice(&gather.adi.to_be_bytes());
+    response.extend_from_slice(&total_known.to_be_bytes());
     response.extend_from_slice(&count.to_be_bytes());
     for addr in &subscribers {
         response.extend_from_slice(addr);
@@ -931,5 +947,81 @@ mod tests {
             ),
             "outbound traffic should fail over to the live backup path"
         );
+    }
+
+    /// OK(MULTICAST_GATHER) carries network id, group MAC, ADI, the total
+    /// number of known members (u32) and the gathered count (u16) before
+    /// the addresses (ZeroTierOne node/Multicaster.cpp gather); nothing is
+    /// sent when nothing was gathered.
+    #[test]
+    fn multicast_gather_ok_uses_upstream_layout() {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let sender = test_identity(0x33);
+        let sender_addr = *sender.address.as_bytes();
+        let from: SocketAddr = "203.0.113.30:9993".parse().unwrap();
+        let shared_secret = [0x66; 48];
+        node.topology.add_peer(sender);
+        {
+            let peer = node.topology.get_peer_mut(&sender_addr).unwrap();
+            peer.add_path(from, true, 1000);
+            peer.state = PeerState::new_active(shared_secret, 10, 1000, 1000);
+        }
+        let group_mac = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
+        let adi = 0x1234_5678u32;
+        let request = MulticastGatherPayload {
+            network_id,
+            flags: 0,
+            mac: group_mac,
+            adi,
+            gather_limit: 1,
+            com: None,
+        };
+        let mut request_buf = [0u8; 64];
+        let request_len = request.serialize(&mut request_buf);
+
+        // Nothing subscribed: no OK at all.
+        handle_multicast_gather(
+            &mut node,
+            &sender_addr,
+            &request_buf[..request_len],
+            from,
+            2000,
+            7,
+        );
+        assert!(node.drain_actions().is_empty());
+
+        let member_a = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+        let member_b = [0x1a, 0x1b, 0x1c, 0x1d, 0x1e];
+        node.multicast_manager
+            .subscribe(network_id, group_mac, adi, member_a, 1000);
+        node.multicast_manager
+            .subscribe(network_id, group_mac, adi, member_b, 1000);
+        handle_multicast_gather(
+            &mut node,
+            &sender_addr,
+            &request_buf[..request_len],
+            from,
+            2000,
+            7,
+        );
+        let actions = node.drain_actions();
+        let NodeAction::SendTo { data, address } = &actions[0] else {
+            panic!("expected OK(MULTICAST_GATHER), got {actions:?}");
+        };
+        assert_eq!(*address, from);
+        let mut packet = data.clone();
+        salsa::dearmor_packet(&shared_secret, &mut packet).unwrap();
+        assert_eq!(packet[27] & 0x1f, Verb::Ok.to_byte());
+        let ok = &packet[28..];
+        assert_eq!(ok[0], Verb::MulticastGather.to_byte());
+        assert_eq!(&ok[1..9], &7u64.to_be_bytes());
+        let body = &ok[9..];
+        assert_eq!(&body[0..8], &network_id.to_be_bytes());
+        assert_eq!(&body[8..14], &group_mac);
+        assert_eq!(&body[14..18], &adi.to_be_bytes());
+        assert_eq!(&body[18..22], &2u32.to_be_bytes(), "total known");
+        assert_eq!(&body[22..24], &1u16.to_be_bytes(), "gathered within limit");
+        assert_eq!(body.len(), 24 + 5);
     }
 }
