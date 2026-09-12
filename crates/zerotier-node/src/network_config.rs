@@ -215,6 +215,8 @@ impl NetworkMembership {
             last_config_request: 0,
             last_multicast_like: 0,
             last_multicast_gather: 0,
+            config_failure: Default::default(),
+            credentials_pushed: Default::default(),
         })
     }
 }

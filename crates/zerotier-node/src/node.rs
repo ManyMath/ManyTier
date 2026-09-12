@@ -34,7 +34,7 @@ use zerotier_protocol::{is_fragment, FragmentHeader, PacketHeader, ProtocolError
 
 use crate::controller::dictionary::Dictionary;
 use crate::multicast::{arp_multicast_group, MulticastGroupKey, MulticastManager};
-use crate::network::{NetworkMember, NetworkMembership};
+use crate::network::{ConfigFailure, NetworkMember, NetworkMembership};
 use crate::peer::PeerState;
 use crate::root::RootManager;
 use crate::switch::{RouteDecision, Switch};
@@ -995,10 +995,10 @@ impl Node {
             Some(Verb::NetworkConfig) => self.handle_network_config(packet, from, now_ms),
             Some(Verb::NetworkCredentials) => self.handle_network_credentials(packet, from, now_ms),
             Some(Verb::Frame) => {
-                crate::vl2::handle_frame(self, &source, verb_payload, from, now_ms)
+                crate::vl2::handle_frame(self, &source, verb_payload, from, now_ms, packet_id)
             }
             Some(Verb::ExtFrame) => {
-                crate::vl2::handle_ext_frame(self, &source, verb_payload, from, now_ms)
+                crate::vl2::handle_ext_frame(self, &source, verb_payload, from, now_ms, packet_id)
             }
             Some(Verb::MulticastLike) => {
                 crate::vl2::handle_multicast_like(self, &source, verb_payload, now_ms)
@@ -1011,9 +1011,14 @@ impl Node {
                 now_ms,
                 packet_id,
             ),
-            Some(Verb::MulticastFrame) => {
-                crate::vl2::handle_multicast_frame(self, &source, verb_payload, from, now_ms)
-            }
+            Some(Verb::MulticastFrame) => crate::vl2::handle_multicast_frame(
+                self,
+                &source,
+                verb_payload,
+                from,
+                now_ms,
+                packet_id,
+            ),
             Some(Verb::NetworkConfigRequest) => {
                 // Emit action for external controller handling
                 match zerotier_protocol::verbs::network_config::NetworkConfigRequestPayload::deserialize(verb_payload) {
@@ -1527,9 +1532,17 @@ impl Node {
     }
 
     /// Handle an incoming ERROR packet.
-    fn handle_error(&mut self, data: &[u8], from: SocketAddr, _now_ms: u64) {
+    /// ERROR is not gated on an outstanding request (ZeroTierOne
+    /// node/IncomingPacket.cpp `_doERROR`); each code is trusted only from
+    /// the peer it can legitimately come from.
+    fn handle_error(&mut self, data: &[u8], from: SocketAddr, now_ms: u64) {
+        use zerotier_protocol::verbs::error::{ErrorCode, ErrorPayload};
+
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
-        let error = match zerotier_protocol::verbs::error::ErrorPayload::deserialize(payload_data) {
+        let Some(source) = PacketHeader::from_bytes(data).map(|hdr| hdr.source_address()) else {
+            return;
+        };
+        let error = match ErrorPayload::deserialize(payload_data) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -1542,6 +1555,151 @@ impl Node {
             error_code = ?error.error_code,
             "received ERROR verb from peer"
         );
+        let Some(network_id) = error
+            .payload
+            .get(..8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes)
+        else {
+            return;
+        };
+
+        let failure = match error.error_code {
+            ErrorCode::NeedMembershipCertificate => {
+                if let Some(action) = self.credentials_packet(
+                    network_id,
+                    &source,
+                    now_ms,
+                    ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT,
+                ) {
+                    self.actions.push(action);
+                }
+                return;
+            }
+            ErrorCode::ObjectNotFound | ErrorCode::UnsupportedOperation => ConfigFailure::NotFound,
+            ErrorCode::NetworkAccessDenied => ConfigFailure::AccessDenied,
+            ErrorCode::NetworkAuthenticationRequired => ConfigFailure::AuthenticationRequired,
+            _ => return,
+        };
+        // Only the network's controller can refuse us a config, and only in
+        // reply to a config request (access denied is not tied to a verb
+        // upstream either).
+        let about_config_request = error.in_re_verb == Verb::NetworkConfigRequest
+            || matches!(
+                error.error_code,
+                ErrorCode::NetworkAccessDenied | ErrorCode::NetworkAuthenticationRequired
+            );
+        if !about_config_request || source != controller_address_from_network_id(network_id) {
+            return;
+        }
+        if let Some(net) = self.find_network_mut(network_id) {
+            net.config_failure = failure;
+        }
+    }
+
+    /// NETWORK_CREDENTIALS carrying our COM for `network_id`, addressed to
+    /// `peer`, unless we pushed them within `min_interval_ms` (and no newer
+    /// config arrived since). Mirrors ZeroTierOne's
+    /// `Network::pushCredentialsIfNeeded` / `peerRequestedCredentials`.
+    pub(crate) fn credentials_packet(
+        &mut self,
+        network_id: u64,
+        peer: &[u8; 5],
+        now_ms: u64,
+        min_interval_ms: u64,
+    ) -> Option<NodeAction> {
+        let net = self.find_network(network_id)?;
+        let com = net.our_com.clone()?;
+        if let Some(last) = net.credentials_pushed.get(peer) {
+            if now_ms.saturating_sub(*last) <= min_interval_ms {
+                return None;
+            }
+        }
+        let secret = self.shared_secret_for_peer(peer)?;
+        let address = self.topology.get_peer(peer)?.best_path(now_ms)?.address;
+
+        let payload = NetworkCredentialsPayload {
+            coms: vec![com],
+            sections: NetworkCredentialsPayload::sections_from(0, &[], 0, &[]),
+        };
+        let mut buf = vec![0u8; 1024];
+        let len = payload.serialize(&mut buf);
+        let packet_id = self.allocate_packet_id();
+        let our_address = *self.identity.address.as_bytes();
+        let packet = crate::vl2::build_encrypted_verb_packet(
+            packet_id,
+            &our_address,
+            peer,
+            Verb::NetworkCredentials,
+            &buf[..len],
+            &secret,
+        )?;
+        if let Some(net) = self.find_network_mut(network_id) {
+            net.credentials_pushed.insert(*peer, now_ms);
+        }
+        Some(NodeAction::SendTo {
+            data: packet,
+            address,
+        })
+    }
+
+    /// Push our credentials before sending `peer` its first frame, and again
+    /// once ZT_PEER_ACTIVITY_TIMEOUT has passed.
+    pub(crate) fn credentials_if_needed(
+        &mut self,
+        network_id: u64,
+        peer: &[u8; 5],
+        now_ms: u64,
+    ) -> Option<NodeAction> {
+        self.credentials_packet(network_id, peer, now_ms, ZT_PEER_ACTIVITY_TIMEOUT)
+    }
+
+    /// Ask `peer` for its credentials after dropping a frame it sent us
+    /// without a valid COM (ZeroTierOne `_sendErrorNeedCredentials`).
+    pub(crate) fn request_credentials(
+        &mut self,
+        peer: &[u8; 5],
+        in_re_verb: Verb,
+        in_re_packet_id: u64,
+        network_id: u64,
+        from: SocketAddr,
+        now_ms: u64,
+    ) {
+        use zerotier_protocol::verbs::error::{ErrorCode, ErrorPayload};
+
+        let Some(secret) = self.shared_secret_for_peer(peer) else {
+            return;
+        };
+        let allowed = self
+            .topology
+            .get_peer_mut(peer)
+            .is_some_and(|p| p.rate_gate_credentials_request(now_ms));
+        if !allowed {
+            return;
+        }
+        let error = ErrorPayload {
+            in_re_verb,
+            in_re_packet_id,
+            error_code: ErrorCode::NeedMembershipCertificate,
+            payload: network_id.to_be_bytes().to_vec(),
+        };
+        let mut buf = [0u8; 32];
+        let len = error.serialize(&mut buf);
+        let packet_id = self.allocate_packet_id();
+        let our_address = *self.identity.address.as_bytes();
+        if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
+            packet_id,
+            &our_address,
+            peer,
+            Verb::Error,
+            &buf[..len],
+            &secret,
+        ) {
+            self.actions.push(NodeAction::SendTo {
+                data: packet,
+                address: from,
+            });
+        }
     }
 
     /// Handle an incoming WHOIS request.
@@ -1806,6 +1964,8 @@ impl Node {
         self.apply_network_config(nc.network_id, &nc.dict_data);
         if let Some(net) = self.find_network_mut(nc.network_id) {
             net.pending_config_request = false;
+            net.config_failure = ConfigFailure::None;
+            net.credentials_pushed.clear();
         }
         self.actions.push(NodeAction::NetworkConfigured {
             network_id: nc.network_id,
@@ -5625,5 +5785,147 @@ mod tests {
             .multicast_manager
             .get_subscribers(network_id, &group_mac, adi + 1, 10)
             .is_empty());
+    }
+
+    fn error_packet(
+        from_peer: &[u8; 5],
+        to: &[u8; 5],
+        in_re_verb: Verb,
+        code: u8,
+        network_id: u64,
+        secret: &[u8; 48],
+    ) -> Vec<u8> {
+        let mut body = vec![in_re_verb.to_byte()];
+        body.extend_from_slice(&9u64.to_be_bytes());
+        body.push(code);
+        body.extend_from_slice(&network_id.to_be_bytes());
+        crate::vl2::build_encrypted_verb_packet(0x99, from_peer, to, Verb::Error, &body, secret)
+            .unwrap()
+    }
+
+    /// ERROR(NEED_MEMBERSHIP_CERTIFICATE) makes us push our COM to the
+    /// asking peer, at most once per ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT.
+    #[test]
+    fn need_membership_certificate_error_pushes_our_com() {
+        use crate::controller::engine::{build_signed_com, zt_address_to_u64};
+
+        let mut rng = XorShift17_11(0x4e43);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+        let network_id = 0xfe00000000abcdef_u64;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let mut net = NetworkMembership::new(network_id, 2800);
+        net.our_com = Some(build_signed_com(
+            &signing_key,
+            &controller_address_from_network_id(network_id),
+            network_id,
+            zt_address_to_u64(&our_addr),
+            1000,
+        ));
+        node.networks.push(net);
+
+        let socket: SocketAddr = "203.0.113.40:9993".parse().unwrap();
+        let secret = [0x31; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x77), socket, secret);
+
+        let mut packet = error_packet(&peer, &our_addr, Verb::ExtFrame, 0x06, network_id, &secret);
+        let actions = node.receive_packet(&mut packet, socket, 5_000);
+        let pushed = |actions: &[NodeAction]| {
+            actions.iter().any(|action| match action {
+                NodeAction::SendTo { data, address } if *address == socket => {
+                    let mut reply = data.clone();
+                    salsa::dearmor_packet(&secret, &mut reply).is_ok()
+                        && Verb::from_byte(reply[27] & 0x1f) == Some(Verb::NetworkCredentials)
+                }
+                _ => false,
+            })
+        };
+        assert!(pushed(&actions), "credentials must be pushed");
+
+        let mut packet = error_packet(&peer, &our_addr, Verb::ExtFrame, 0x06, network_id, &secret);
+        assert!(!pushed(&node.receive_packet(&mut packet, socket, 5_500)));
+        let mut packet = error_packet(&peer, &our_addr, Verb::ExtFrame, 0x06, network_id, &secret);
+        assert!(pushed(&node.receive_packet(&mut packet, socket, 6_600)));
+    }
+
+    /// ACCESS_DENIED / NOT_FOUND from the network's controller set the
+    /// network status; the same errors from any other peer are ignored, and
+    /// a new config clears them.
+    #[test]
+    fn controller_errors_set_network_status() {
+        let mut rng = XorShift17_11(0x4e44);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+
+        let controller = Identity::generate(&mut rng).unwrap();
+        let controller_addr = *controller.address.as_bytes();
+        let network_id = (u64::from_be_bytes([
+            0,
+            0,
+            0,
+            controller_addr[0],
+            controller_addr[1],
+            controller_addr[2],
+            controller_addr[3],
+            controller_addr[4],
+        ]) << 24)
+            | 0x000001;
+        node.join_network(NetworkMembership::new(network_id, 2800));
+        let socket: SocketAddr = "203.0.113.41:9993".parse().unwrap();
+        let secret = [0x32; 48];
+        add_active_peer(&mut node, controller, socket, secret);
+        let other_socket: SocketAddr = "203.0.113.42:9993".parse().unwrap();
+        let other = add_active_peer(&mut node, test_identity(0x78), other_socket, secret);
+
+        let status = |node: &Node| node.find_network(network_id).unwrap().status_name();
+        assert_eq!(status(&node), "REQUESTING_CONFIGURATION");
+
+        let mut packet = error_packet(
+            &other,
+            &our_addr,
+            Verb::NetworkConfigRequest,
+            0x07,
+            network_id,
+            &secret,
+        );
+        node.receive_packet(&mut packet, other_socket, 5_000);
+        assert_eq!(status(&node), "REQUESTING_CONFIGURATION");
+
+        let mut packet = error_packet(
+            &controller_addr,
+            &our_addr,
+            Verb::NetworkConfigRequest,
+            0x07,
+            network_id,
+            &secret,
+        );
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert_eq!(status(&node), "ACCESS_DENIED");
+
+        // NOT_FOUND only counts as a reply to a config request.
+        let mut packet = error_packet(
+            &controller_addr,
+            &our_addr,
+            Verb::Echo,
+            0x03,
+            network_id,
+            &secret,
+        );
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert_eq!(status(&node), "ACCESS_DENIED");
+        let mut packet = error_packet(
+            &controller_addr,
+            &our_addr,
+            Verb::NetworkConfigRequest,
+            0x03,
+            network_id,
+            &secret,
+        );
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert_eq!(status(&node), "NOT_FOUND");
     }
 }

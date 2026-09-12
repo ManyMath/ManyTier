@@ -110,8 +110,9 @@ pub fn handle_frame(
     node: &mut Node,
     sender_address: &[u8; 5],
     payload_data: &[u8],
-    _from: SocketAddr,
-    _now_ms: u64,
+    from: SocketAddr,
+    now_ms: u64,
+    packet_id: u64,
 ) {
     let frame = match FramePayload::parse(payload_data) {
         Ok(f) => f,
@@ -127,8 +128,15 @@ pub fn handle_frame(
     // Verify sender's COM
     let has_valid_com = has_peer_com(node, network.network_id, sender_address);
     if !has_valid_com {
-        // No valid COM -- would send ERROR_NEED_MEMBERSHIP_CERTIFICATE in a full impl.
-        // For now, just drop.
+        let network_id = network.network_id;
+        node.request_credentials(
+            sender_address,
+            Verb::Frame,
+            packet_id,
+            network_id,
+            from,
+            now_ms,
+        );
         return;
     }
 
@@ -152,8 +160,9 @@ pub fn handle_ext_frame(
     node: &mut Node,
     sender_address: &[u8; 5],
     payload_data: &[u8],
-    _from: SocketAddr,
-    _now_ms: u64,
+    from: SocketAddr,
+    now_ms: u64,
+    packet_id: u64,
 ) {
     let ext = match ExtFramePayload::parse(payload_data) {
         Ok(e) => e,
@@ -169,7 +178,15 @@ pub fn handle_ext_frame(
     // Verify sender's COM
     let has_valid_com = has_peer_com(node, network.network_id, sender_address);
     if !has_valid_com {
-        // No valid COM -- would send ERROR_NEED_MEMBERSHIP_CERTIFICATE
+        let network_id = network.network_id;
+        node.request_credentials(
+            sender_address,
+            Verb::ExtFrame,
+            packet_id,
+            network_id,
+            from,
+            now_ms,
+        );
         return;
     }
 
@@ -311,8 +328,9 @@ pub fn handle_multicast_frame(
     node: &mut Node,
     sender_address: &[u8; 5],
     payload_data: &[u8],
-    _from: SocketAddr,
-    _now_ms: u64,
+    from: SocketAddr,
+    now_ms: u64,
+    packet_id: u64,
 ) {
     let mf = match MulticastFramePayload::parse(payload_data) {
         Ok(m) => m,
@@ -328,6 +346,15 @@ pub fn handle_multicast_frame(
     // Verify sender's COM
     let has_valid_com = has_peer_com(node, network.network_id, sender_address);
     if !has_valid_com {
+        let network_id = network.network_id;
+        node.request_credentials(
+            sender_address,
+            Verb::MulticastFrame,
+            packet_id,
+            network_id,
+            from,
+            now_ms,
+        );
         return;
     }
 
@@ -430,57 +457,24 @@ pub fn process_outbound_frame(
             if payload.len() >= 20 {
                 let dest_ip =
                     core::net::Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]);
-                if network.lookup_ipv4(dest_ip).is_none() {
-                    unknown_destination = !dest_ip.is_multicast()
-                        && !dest_ip.is_broadcast()
-                        && !is_directed_broadcast_v4(network, dest_ip);
-                }
-                if let Some(member) = network.lookup_ipv4(dest_ip) {
-                    let member_address = member.zt_address;
-                    let member_mac = member.mac;
-                    let ext = ExtFramePayload {
-                        network_id,
-                        flags: 0,
-                        dest_mac: member_mac,
-                        src_mac: our_mac,
-                        ethertype,
-                        payload,
-                    };
-
-                    let path_and_secret =
-                        node.topology.get_peer(&member_address).and_then(|peer| {
-                            peer.best_path(now_ms).and_then(|path| {
-                                peer.shared_secret().map(|secret| (path.address, *secret))
-                            })
-                        });
-
-                    if let Some((path_address, shared_secret)) = path_and_secret {
-                        let packet_id = node.allocate_packet_id();
-                        if let Some(pkt) = build_ext_frame_packet(
-                            packet_id,
-                            our_zt_address,
-                            &member_address,
-                            &ext,
-                            &shared_secret,
-                        ) {
-                            tracing::info!(
-                                target: "manytier",
-                                event = "vl2_ext_frame_out",
-                                dest_addr = %path_address,
-                                pkt_len = pkt.len(),
-                                "sending EXT_FRAME"
-                            );
-                            push_fragmented_send(
-                                &mut actions,
-                                pkt,
-                                path_address,
-                                ZT_DEFAULT_PHYSMTU,
-                            );
-                        }
-                    } else {
-                        actions.push(NodeAction::WhoisNeeded {
-                            addresses: alloc::vec![member_address],
-                        });
+                match network.lookup_ipv4(dest_ip) {
+                    Some(member) => {
+                        let (member_address, member_mac) = (member.zt_address, member.mac);
+                        send_unicast_frame(
+                            node,
+                            &mut actions,
+                            network_id,
+                            (member_address, member_mac),
+                            our_mac,
+                            ethertype,
+                            payload,
+                            now_ms,
+                        );
+                    }
+                    None => {
+                        unknown_destination = !dest_ip.is_multicast()
+                            && !dest_ip.is_broadcast()
+                            && !is_directed_broadcast_v4(network, dest_ip);
                     }
                 }
             }
@@ -491,49 +485,21 @@ pub fn process_outbound_frame(
                 let mut dst_bytes = [0u8; 16];
                 dst_bytes.copy_from_slice(&payload[24..40]);
                 let dest_ip = core::net::Ipv6Addr::from(dst_bytes);
-                if network.lookup_ipv6(dest_ip).is_none() {
-                    unknown_destination = !dest_ip.is_multicast();
-                }
-                if let Some(member) = network.lookup_ipv6(dest_ip) {
-                    let member_address = member.zt_address;
-                    let member_mac = member.mac;
-                    let ext = ExtFramePayload {
-                        network_id,
-                        flags: 0,
-                        dest_mac: member_mac,
-                        src_mac: our_mac,
-                        ethertype,
-                        payload,
-                    };
-
-                    let path_and_secret =
-                        node.topology.get_peer(&member_address).and_then(|peer| {
-                            peer.best_path(now_ms).and_then(|path| {
-                                peer.shared_secret().map(|secret| (path.address, *secret))
-                            })
-                        });
-
-                    if let Some((path_address, shared_secret)) = path_and_secret {
-                        let packet_id = node.allocate_packet_id();
-                        if let Some(pkt) = build_ext_frame_packet(
-                            packet_id,
-                            our_zt_address,
-                            &member_address,
-                            &ext,
-                            &shared_secret,
-                        ) {
-                            push_fragmented_send(
-                                &mut actions,
-                                pkt,
-                                path_address,
-                                ZT_DEFAULT_PHYSMTU,
-                            );
-                        }
-                    } else {
-                        actions.push(NodeAction::WhoisNeeded {
-                            addresses: alloc::vec![member_address],
-                        });
+                match network.lookup_ipv6(dest_ip) {
+                    Some(member) => {
+                        let (member_address, member_mac) = (member.zt_address, member.mac);
+                        send_unicast_frame(
+                            node,
+                            &mut actions,
+                            network_id,
+                            (member_address, member_mac),
+                            our_mac,
+                            ethertype,
+                            payload,
+                            now_ms,
+                        );
                     }
+                    None => unknown_destination = !dest_ip.is_multicast(),
                 }
             }
         }
@@ -549,6 +515,62 @@ pub fn process_outbound_frame(
     }
 
     actions
+}
+
+/// Send `payload` to one member as an EXT_FRAME. Our credentials go first
+/// when the member has not had them recently, as ZeroTier One does before
+/// every unicast (node/Switch.cpp `pushCredentialsIfNeeded`): a peer that
+/// lacks our COM drops the frame.
+#[allow(clippy::too_many_arguments)]
+fn send_unicast_frame(
+    node: &mut Node,
+    actions: &mut Vec<NodeAction>,
+    network_id: u64,
+    (member_address, member_mac): ([u8; 5], [u8; 6]),
+    our_mac: [u8; 6],
+    ethertype: u16,
+    payload: &[u8],
+    now_ms: u64,
+) {
+    let path_and_secret = node.topology.get_peer(&member_address).and_then(|peer| {
+        peer.best_path(now_ms)
+            .and_then(|path| peer.shared_secret().map(|secret| (path.address, *secret)))
+    });
+    let Some((path_address, shared_secret)) = path_and_secret else {
+        actions.push(NodeAction::WhoisNeeded {
+            addresses: alloc::vec![member_address],
+        });
+        return;
+    };
+    if let Some(push) = node.credentials_if_needed(network_id, &member_address, now_ms) {
+        actions.push(push);
+    }
+    let our_zt_address = *node.identity.address.as_bytes();
+    let ext = ExtFramePayload {
+        network_id,
+        flags: 0,
+        dest_mac: member_mac,
+        src_mac: our_mac,
+        ethertype,
+        payload,
+    };
+    let packet_id = node.allocate_packet_id();
+    if let Some(pkt) = build_ext_frame_packet(
+        packet_id,
+        &our_zt_address,
+        &member_address,
+        &ext,
+        &shared_secret,
+    ) {
+        tracing::info!(
+            target: "manytier",
+            event = "vl2_ext_frame_out",
+            dest_addr = %path_address,
+            pkt_len = pkt.len(),
+            "sending EXT_FRAME"
+        );
+        push_fragmented_send(actions, pkt, path_address, ZT_DEFAULT_PHYSMTU);
+    }
 }
 
 /// Directed broadcast of any member's IPv4 prefix.
@@ -1023,5 +1045,129 @@ mod tests {
         assert_eq!(&body[18..22], &2u32.to_be_bytes(), "total known");
         assert_eq!(&body[22..24], &1u16.to_be_bytes(), "gathered within limit");
         assert_eq!(body.len(), 24 + 5);
+    }
+
+    fn decrypted_verb(data: &[u8], secret: &[u8; 48]) -> Option<(Verb, Vec<u8>)> {
+        let mut packet = data.to_vec();
+        salsa::dearmor_packet(secret, &mut packet).ok()?;
+        Some((Verb::from_byte(packet[27] & 0x1f)?, packet[28..].to_vec()))
+    }
+
+    /// Our COM goes to a member before its first frame (ZeroTierOne pushes
+    /// credentials before every unicast if they are stale), then not again
+    /// until ZT_PEER_ACTIVITY_TIMEOUT has passed.
+    #[test]
+    fn unicast_frame_is_preceded_by_our_credentials() {
+        use zerotier_protocol::constants::ZT_PEER_ACTIVITY_TIMEOUT;
+
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let peer_id = test_identity(0x42);
+        let peer_address = *peer_id.address.as_bytes();
+        let path: SocketAddr = "10.0.0.10:9993".parse().unwrap();
+        let secret = [0x55; 48];
+        node.topology.add_peer(peer_id);
+        {
+            let peer = node.topology.get_peer_mut(&peer_address).unwrap();
+            peer.add_path(path, true, 1000);
+            peer.state = PeerState::new_active(secret, 10, 1000, 1000);
+        }
+        node.find_network_mut(network_id)
+            .unwrap()
+            .members
+            .push(NetworkMember {
+                zt_address: peer_address,
+                mac: ethernet::derive_mac(&peer_address, network_id),
+                ipv4: Some((Ipv4Addr::new(10, 147, 20, 2), 24)),
+                ipv6: None,
+                authorized: true,
+            });
+        let mut ipv4_packet = [0u8; 20];
+        ipv4_packet[0] = 0x45;
+        ipv4_packet[16..20].copy_from_slice(&[10, 147, 20, 2]);
+
+        let verbs_at = |node: &mut Node, now_ms: u64| -> Vec<Verb> {
+            process_outbound_frame(
+                node,
+                network_id,
+                ethernet::ETHERTYPE_IPV4,
+                &ipv4_packet,
+                &our_address,
+                now_ms,
+            )
+            .iter()
+            .filter_map(|action| match action {
+                NodeAction::SendTo { data, .. } => decrypted_verb(data, &secret).map(|(v, _)| v),
+                _ => None,
+            })
+            .collect()
+        };
+
+        assert_eq!(
+            verbs_at(&mut node, 2000),
+            vec![Verb::NetworkCredentials, Verb::ExtFrame]
+        );
+        assert_eq!(verbs_at(&mut node, 3000), vec![Verb::ExtFrame]);
+        let later = 3000 + ZT_PEER_ACTIVITY_TIMEOUT;
+        node.topology
+            .get_peer_mut(&peer_address)
+            .unwrap()
+            .add_path(path, true, later);
+        assert_eq!(
+            verbs_at(&mut node, later),
+            vec![Verb::NetworkCredentials, Verb::ExtFrame]
+        );
+    }
+
+    /// A frame from a peer we hold no COM for is dropped and answered with
+    /// ERROR(NEED_MEMBERSHIP_CERTIFICATE), at most once per second.
+    #[test]
+    fn frame_without_com_requests_credentials_once_per_second() {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let sender = test_identity(0x43);
+        let sender_address = *sender.address.as_bytes();
+        let from: SocketAddr = "10.0.0.12:9993".parse().unwrap();
+        let secret = [0x56; 48];
+        node.topology.add_peer(sender);
+        {
+            let peer = node.topology.get_peer_mut(&sender_address).unwrap();
+            peer.add_path(from, true, 1000);
+            peer.state = PeerState::new_active(secret, 10, 1000, 1000);
+        }
+        let our_mac = node
+            .find_network(network_id)
+            .unwrap()
+            .our_mac(node.identity.address.as_bytes());
+        let ext = ExtFramePayload {
+            network_id,
+            flags: 0,
+            dest_mac: our_mac,
+            src_mac: ethernet::derive_mac(&sender_address, network_id),
+            ethertype: 0x0800,
+            payload: &[0x45, 0, 0, 20],
+        };
+        let mut buf = [0u8; 128];
+        let n = ext.serialize(&mut buf);
+
+        handle_ext_frame(&mut node, &sender_address, &buf[..n], from, 2000, 77);
+        let actions = node.drain_actions();
+        assert_eq!(actions.len(), 1, "frame must be dropped, got {actions:?}");
+        let NodeAction::SendTo { data, address } = &actions[0] else {
+            panic!("expected an ERROR, got {actions:?}");
+        };
+        assert_eq!(*address, from);
+        let (verb, body) = decrypted_verb(data, &secret).unwrap();
+        assert_eq!(verb, Verb::Error);
+        assert_eq!(body[0], Verb::ExtFrame.to_byte());
+        assert_eq!(&body[1..9], &77u64.to_be_bytes());
+        assert_eq!(body[9], 0x06);
+        assert_eq!(&body[10..18], &network_id.to_be_bytes());
+
+        handle_ext_frame(&mut node, &sender_address, &buf[..n], from, 2500, 78);
+        assert!(node.drain_actions().is_empty());
+        handle_ext_frame(&mut node, &sender_address, &buf[..n], from, 3100, 79);
+        assert_eq!(node.drain_actions().len(), 1);
     }
 }

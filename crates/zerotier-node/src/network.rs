@@ -5,6 +5,7 @@
 /// members by IP or MAC address.
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -31,6 +32,17 @@ pub struct Route {
     pub target: alloc::string::String,
 }
 
+/// Why the controller refused us a config, as ZeroTier One tracks it
+/// (`Network::_netconfFailure`). Cleared when a config is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigFailure {
+    #[default]
+    None,
+    AccessDenied,
+    NotFound,
+    AuthenticationRequired,
+}
+
 /// Network membership state: tracks members, COMs, and provides lookups.
 #[derive(Debug, Clone)]
 pub struct NetworkMembership {
@@ -46,6 +58,10 @@ pub struct NetworkMembership {
     pub last_config_request: u64,
     pub last_multicast_like: u64,
     pub last_multicast_gather: u64,
+    pub config_failure: ConfigFailure,
+    /// When our credentials were last pushed to each peer. Cleared when a
+    /// new config arrives so every peer gets the new COM.
+    pub credentials_pushed: BTreeMap<[u8; 5], u64>,
 }
 
 impl NetworkMembership {
@@ -64,6 +80,19 @@ impl NetworkMembership {
             last_config_request: 0,
             last_multicast_like: 0,
             last_multicast_gather: 0,
+            config_failure: ConfigFailure::None,
+            credentials_pushed: BTreeMap::new(),
+        }
+    }
+
+    /// Network status as ZeroTier One names it (`ZT_VirtualNetworkStatus`).
+    pub fn status_name(&self) -> &'static str {
+        match self.config_failure {
+            ConfigFailure::AccessDenied => "ACCESS_DENIED",
+            ConfigFailure::NotFound => "NOT_FOUND",
+            ConfigFailure::AuthenticationRequired => "AUTHENTICATION_REQUIRED",
+            ConfigFailure::None if self.our_com.is_some() => "OK",
+            ConfigFailure::None => "REQUESTING_CONFIGURATION",
         }
     }
 

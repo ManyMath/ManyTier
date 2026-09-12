@@ -154,6 +154,14 @@ pub const ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME: u64 = 30_000;
 /// node/Constants.hpp `ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT`.
 pub const ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT: u8 = 8;
 
+/// Minimum spacing of rate-limited per-peer replies such as credential
+/// requests (ZeroTierOne node/Constants.hpp `ZT_PEER_GENERAL_RATE_LIMIT`).
+pub const ZT_PEER_GENERAL_RATE_LIMIT: u64 = 1_000;
+
+/// Minimum spacing of credential pushes a peer can request
+/// (`ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT`).
+pub const ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT: u64 = 1_000;
+
 /// PUSH_DIRECT_PATHS record flag: forget this path (node/Packet.hpp).
 pub const PUSH_DIRECT_PATHS_FLAG_FORGET_PATH: u8 = 0x01;
 

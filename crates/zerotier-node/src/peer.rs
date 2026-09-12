@@ -10,8 +10,8 @@ use core::net::SocketAddr;
 use zeroize::ZeroizeOnDrop;
 use zerotier_crypto::identity::Identity;
 use zerotier_protocol::{
-    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_PING_PERIOD,
-    ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
+    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_GENERAL_RATE_LIMIT,
+    ZT_PEER_PING_PERIOD, ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
 };
 
 use crate::path::Path;
@@ -126,6 +126,8 @@ pub struct Peer {
     last_direct_path_push_receive: u64,
     /// Pushes received inside the current cutoff window.
     direct_path_push_cutoff_count: u8,
+    /// Last ERROR(NEED_MEMBERSHIP_CERTIFICATE) we sent this peer.
+    last_credentials_request: u64,
 }
 
 impl Peer {
@@ -139,7 +141,20 @@ impl Peer {
             last_direct_path_push: 0,
             last_direct_path_push_receive: 0,
             direct_path_push_cutoff_count: 0,
+            last_credentials_request: 0,
         }
+    }
+
+    /// At most one credentials request per peer per
+    /// ZT_PEER_GENERAL_RATE_LIMIT, however many frames it sends meanwhile.
+    pub fn rate_gate_credentials_request(&mut self, now_ms: u64) -> bool {
+        if self.last_credentials_request != 0
+            && now_ms.saturating_sub(self.last_credentials_request) < ZT_PEER_GENERAL_RATE_LIMIT
+        {
+            return false;
+        }
+        self.last_credentials_request = now_ms;
+        true
     }
 
     /// Rate gate for received PUSH_DIRECT_PATHS, as ZeroTierOne
