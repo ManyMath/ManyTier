@@ -49,11 +49,7 @@ fn membership_to_response(
     }
 
     let mac = zerotier_node::ethernet::derive_mac(our_addr, net.network_id);
-    let status = if net.our_com.is_some() {
-        "OK"
-    } else {
-        "REQUESTING_CONFIGURATION"
-    };
+    let status = net.status_name();
 
     NetworkResponse {
         id: format!("{:016x}", net.network_id),
