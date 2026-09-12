@@ -2245,10 +2245,7 @@ impl Node {
                 // This triggers NAT hole-punching so they can establish direct paths.
                 self.maybe_send_rendezvous(&source, &dest, now_ms);
             }
-            RouteDecision::Relay {
-                root_address,
-                dest_zt_address: _,
-            } => {
+            RouteDecision::Relay { root_address, .. } => {
                 self.actions.push(NodeAction::SendTo {
                     data: data.to_vec(),
                     address: root_address,

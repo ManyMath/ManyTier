@@ -144,13 +144,31 @@ impl Topology {
 
     /// Get a root peer for relaying/WHOIS.
     ///
-    /// Returns the first known root; latency-based root selection is
-    /// out of scope for V1.
+    /// Returns the first known root regardless of reachability; use
+    /// [`Topology::best_root`] to pick one to send through.
     pub fn get_root(&self) -> Option<&Peer> {
         self.roots
             .iter()
             .filter_map(|addr| self.peers.get(addr))
             .next()
+    }
+
+    /// The root to send through: the one with the best live path, else the
+    /// first root with any known path (ZeroTierOne `getUpstreamPeer`).
+    pub fn best_root(&self, now_ms: u64) -> Option<(&[u8; 5], &Peer)> {
+        let roots = || {
+            self.roots
+                .iter()
+                .filter_map(|addr| self.peers.get(addr).map(|peer| (addr, peer)))
+        };
+        roots()
+            .filter_map(|(addr, peer)| {
+                peer.best_path(now_ms)
+                    .map(|path| (path.quality_score(now_ms), addr, peer))
+            })
+            .min_by_key(|(score, _, _)| *score)
+            .map(|(_, addr, peer)| (addr, peer))
+            .or_else(|| roots().find(|(_, peer)| !peer.paths.is_empty()))
     }
 
     /// Get a mutable reference to a root peer.

@@ -14,6 +14,7 @@ pub enum RouteDecision {
     /// Relay through a root server.
     Relay {
         root_address: core::net::SocketAddr,
+        root_zt_address: [u8; 5],
         dest_zt_address: [u8; 5],
     },
     /// No route available (drop the packet).
@@ -44,18 +45,12 @@ impl Switch {
             }
         }
 
-        // Relay through best root
-        if let Some(root) = topology.get_root() {
-            if let Some(root_path) = root.best_path(now_ms) {
+        // Relay through the best reachable root
+        if let Some((root_zt_address, root)) = topology.best_root(now_ms) {
+            if let Some(path) = root.best_path(now_ms).or_else(|| root.paths.first()) {
                 return RouteDecision::Relay {
-                    root_address: root_path.address,
-                    dest_zt_address: *dest,
-                };
-            }
-            // Root exists but no alive path
-            if let Some(first_path) = root.paths.first() {
-                return RouteDecision::Relay {
-                    root_address: first_path.address,
+                    root_address: path.address,
+                    root_zt_address: *root_zt_address,
                     dest_zt_address: *dest,
                 };
             }
@@ -136,6 +131,7 @@ mod tests {
             decision,
             RouteDecision::Relay {
                 root_address: "10.0.0.99:9993".parse().unwrap(),
+                root_zt_address: root_addr,
                 dest_zt_address: unknown_addr,
             }
         );
@@ -165,7 +161,36 @@ mod tests {
             decision,
             RouteDecision::Relay {
                 root_address: "10.0.0.99:9993".parse().unwrap(),
+                root_zt_address: root_addr,
                 dest_zt_address: addr_bytes,
+            }
+        );
+    }
+
+    #[test]
+    fn route_prefers_a_live_root_over_the_first_one() {
+        let mut topo = Topology::new();
+        let dead_id = make_identity(0xe0);
+        let dead_addr = *dead_id.address.as_bytes();
+        let mut dead = Peer::new(dead_id, true);
+        dead.add_path("10.0.0.98:9993".parse().unwrap(), true, 1000);
+        topo.peers.insert(dead_addr, dead);
+        topo.roots.push(dead_addr);
+
+        let live_id = make_identity(0xe1);
+        let live_addr = *live_id.address.as_bytes();
+        let mut live = Peer::new(live_id, true);
+        live.add_path("10.0.0.99:9993".parse().unwrap(), true, 900_000);
+        topo.peers.insert(live_addr, live);
+        topo.roots.push(live_addr);
+
+        let dest = [0x11, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(
+            Switch::route(&topo, &dest, 1_000_000),
+            RouteDecision::Relay {
+                root_address: "10.0.0.99:9993".parse().unwrap(),
+                root_zt_address: live_addr,
+                dest_zt_address: dest,
             }
         );
     }
