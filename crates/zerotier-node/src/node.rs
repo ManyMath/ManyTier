@@ -6,7 +6,7 @@
 /// directly performs I/O.
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -191,6 +191,11 @@ pub struct Node {
     pending_multicast_gathers: Vec<PendingMulticastGather>,
     pending_network_configs: Vec<PendingNetworkConfig>,
     pending_encrypted_packets: Vec<PendingEncryptedPacket>,
+    /// Physical addresses we received an authenticated packet from, and
+    /// when; only these may use us as a relay.
+    trusted_paths: BTreeMap<SocketAddr, u64>,
+    /// Last RENDEZVOUS introduction per unordered peer pair.
+    last_unite: BTreeMap<([u8; 5], [u8; 5]), u64>,
 }
 
 impl Node {
@@ -225,6 +230,8 @@ impl Node {
             pending_multicast_gathers: Vec::new(),
             pending_network_configs: Vec::new(),
             pending_encrypted_packets: Vec::new(),
+            trusted_paths: BTreeMap::new(),
+            last_unite: BTreeMap::new(),
         })
     }
 
@@ -850,9 +857,15 @@ impl Node {
             packet_id = hdr.packet_id();
         }
 
+        // Nothing legitimate arrives claiming to come from us
+        // (ZeroTierOne node/Switch.cpp onRemotePacket).
+        if source == *self.identity.address.as_bytes() {
+            return;
+        }
+
         // Check if destined for us
         if dest != *self.identity.address.as_bytes() {
-            self.handle_relay(data, now_ms);
+            self.handle_relay(data, from, now_ms);
             return;
         }
 
@@ -951,6 +964,9 @@ impl Node {
         // authenticated yet at this point (its handler verifies the MAC and
         // records the path itself), so an unverified header must not touch
         // peer state.
+        if dearmored && !is_relayed {
+            self.trusted_paths.insert(from, now_ms);
+        }
         if let Some(peer) = self.topology.get_peer_mut(&source).filter(|_| dearmored) {
             if !is_relayed {
                 // Check if path was relay before promotion for logging
@@ -1345,6 +1361,9 @@ impl Node {
             if let Some(peer) = self.topology.get_peer_mut(&source_addr_bytes) {
                 peer.add_path(from, Self::arrived_directly(data), now_ms);
                 peer.state = PeerState::new_active(shared_secret, 0, now_ms, now_ms);
+            }
+            if Self::arrived_directly(data) {
+                self.trusted_paths.insert(from, now_ms);
             }
 
             tracing::info!(
@@ -2220,7 +2239,30 @@ impl Node {
     /// both have active sessions, it sends RENDEZVOUS to each peer with the
     /// other's physical address. This triggers UDP hole-punching so the peers
     /// can establish a direct path.
-    fn handle_relay(&mut self, data: &mut [u8], now_ms: u64) {
+    /// Forward a packet addressed to someone else.
+    ///
+    /// ZeroTier One relays for anyone only when it is a root, and otherwise
+    /// only for paths it trusts (node/Switch.cpp onRemotePacket). A ManyTier
+    /// root need not list itself as one, so trust here means an
+    /// authenticated packet arrived on `from` within ZT_TRUST_EXPIRATION:
+    /// spoofed or never-authenticated sources cannot use us as a relay.
+    fn handle_relay(&mut self, data: &mut [u8], from: SocketAddr, now_ms: u64) {
+        let our_address = *self.identity.address.as_bytes();
+        let trusted = self.topology.roots.contains(&our_address)
+            || self
+                .trusted_paths
+                .get(&from)
+                .is_some_and(|seen| now_ms.saturating_sub(*seen) < ZT_TRUST_EXPIRATION);
+        if !trusted {
+            tracing::debug!(
+                target: "manytier",
+                event = "relay_from_untrusted_path_dropped",
+                from = %from,
+                "not relaying for a path without an authenticated session"
+            );
+            return;
+        }
+
         // Increment hop count
         if !Switch::increment_hops(data) {
             return; // Max hops reached, drop
@@ -2241,11 +2283,21 @@ impl Node {
                     address,
                 });
 
-                // Send RENDEZVOUS to both peers if we have active sessions with both.
-                // This triggers NAT hole-punching so they can establish direct paths.
-                self.maybe_send_rendezvous(&source, &dest, now_ms);
+                // Introduce the two peers so they can punch a direct path,
+                // at most once per ZT_MIN_UNITE_INTERVAL per pair.
+                if self.should_unite(&source, &dest, now_ms) {
+                    self.maybe_send_rendezvous(&source, &dest, now_ms);
+                }
             }
-            RouteDecision::Relay { root_address, .. } => {
+            RouteDecision::Relay {
+                root_address,
+                root_zt_address,
+                ..
+            } => {
+                // Never bounce a packet back to the root that sent it.
+                if root_zt_address == source {
+                    return;
+                }
                 self.actions.push(NodeAction::SendTo {
                     data: data.to_vec(),
                     address: root_address,
@@ -2255,6 +2307,16 @@ impl Node {
                 // No route available
             }
         }
+    }
+
+    fn should_unite(&mut self, a: &[u8; 5], b: &[u8; 5], now_ms: u64) -> bool {
+        let key = if a < b { (*a, *b) } else { (*b, *a) };
+        let last = self.last_unite.entry(key).or_insert(0);
+        if *last != 0 && now_ms.saturating_sub(*last) < ZT_MIN_UNITE_INTERVAL {
+            return false;
+        }
+        *last = now_ms;
+        true
     }
 
     /// Send RENDEZVOUS to two peers so they can establish a direct path.
@@ -2585,6 +2647,11 @@ impl Node {
         const MULTICAST_SUBSCRIPTION_MAX_AGE_MS: u64 = 90_000;
 
         self.actions.clear();
+
+        self.trusted_paths
+            .retain(|_, seen| now_ms.saturating_sub(*seen) < ZT_TRUST_EXPIRATION);
+        self.last_unite
+            .retain(|_, last| now_ms.saturating_sub(*last) < ZT_MIN_UNITE_INTERVAL);
 
         // 1. Evict stale fragments from reassembly buffer
         self.reassembly
@@ -3614,7 +3681,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_packet_not_for_us_relays() {
+    fn receive_packet_not_for_us_relays_only_for_trusted_paths() {
         let id = test_identity(0x01);
         let planet = make_synthetic_planet();
         let mut node = Node::new(id, &planet, 1).unwrap();
@@ -3622,20 +3689,56 @@ mod tests {
         // Build a packet destined for someone else
         let mut pkt = [0u8; 64];
         pkt[0..8].copy_from_slice(&1000u64.to_be_bytes()); // IV
-        pkt[8..13].copy_from_slice(&[0xff, 0xfe, 0xfd, 0xfc, 0xfb]); // dest = not us
+        pkt[8..13].copy_from_slice(&[0xfe, 0xfe, 0xfd, 0xfc, 0xfb]); // dest = not us
         pkt[13..18].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]); // source
         pkt[18] = 0; // flags: cipher suite 0, hops 0
         pkt[27] = 0x01; // verb = HELLO
 
+        // Nothing authenticated has arrived from this address: no relay.
         let from: SocketAddr = "10.0.0.1:9993".parse().unwrap();
-        let actions = node.receive_packet(&mut pkt, from, 1000);
+        let actions = node.receive_packet(&mut pkt.clone(), from, 1000);
+        assert!(actions.is_empty(), "untrusted source must not be relayed");
 
-        // Should attempt relay (may produce SendTo if root has path)
-        // The root exists so should produce a Relay action
+        // Once a session is authenticated on the path, the root relays.
+        node.trusted_paths.insert(from, 900);
+        let actions = node.receive_packet(&mut pkt.clone(), from, 1000);
         let has_send = actions
             .iter()
             .any(|a| matches!(a, NodeAction::SendTo { .. }));
         assert!(has_send, "relay should produce SendTo to root");
+
+        // Trust expires.
+        let later = 900 + ZT_TRUST_EXPIRATION;
+        assert!(node
+            .receive_packet(&mut pkt.clone(), from, later)
+            .is_empty());
+    }
+
+    #[test]
+    fn packets_claiming_our_own_address_are_dropped() {
+        let id = test_identity(0x01);
+        let our_addr = *id.address.as_bytes();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let from: SocketAddr = "10.0.0.1:9993".parse().unwrap();
+        node.trusted_paths.insert(from, 900);
+
+        let mut pkt = [0u8; 64];
+        pkt[8..13].copy_from_slice(&[0xfe, 0xfe, 0xfd, 0xfc, 0xfb]);
+        pkt[13..18].copy_from_slice(&our_addr);
+        pkt[27] = 0x01;
+        assert!(node.receive_packet(&mut pkt, from, 1000).is_empty());
+    }
+
+    #[test]
+    fn introductions_are_rate_limited_per_pair() {
+        let id = test_identity(0x01);
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let (a, b) = ([0x0a; 5], [0x0b; 5]);
+        assert!(node.should_unite(&a, &b, 1000));
+        assert!(!node.should_unite(&b, &a, 2000));
+        assert!(node.should_unite(&a, &b, 1000 + ZT_MIN_UNITE_INTERVAL));
     }
 
     #[test]
@@ -3644,16 +3747,17 @@ mod tests {
         let planet = make_synthetic_planet();
         let mut node = Node::new(id, &planet, 1).unwrap();
 
-        // Same relay-eligible packet as `receive_packet_not_for_us_relays`, but
+        // Same relay-eligible packet as the trusted-path relay test, but
         // already at the max hop count -- must be dropped, not forwarded again.
         let mut pkt = [0u8; 64];
         pkt[0..8].copy_from_slice(&1000u64.to_be_bytes()); // IV
-        pkt[8..13].copy_from_slice(&[0xff, 0xfe, 0xfd, 0xfc, 0xfb]); // dest = not us
+        pkt[8..13].copy_from_slice(&[0xfe, 0xfe, 0xfd, 0xfc, 0xfb]); // dest = not us
         pkt[13..18].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]); // source
         pkt[18] = zerotier_protocol::constants::ZT_RELAY_MAX_HOPS; // already at max
         pkt[27] = 0x01; // verb = HELLO
 
         let from: SocketAddr = "10.0.0.1:9993".parse().unwrap();
+        node.trusted_paths.insert(from, 900);
         let actions = node.receive_packet(&mut pkt, from, 1000);
 
         assert!(
