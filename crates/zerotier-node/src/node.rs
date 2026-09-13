@@ -2235,6 +2235,21 @@ impl Node {
             Ok(r) => r,
             Err(_) => return,
         };
+        // Only roots introduce peers, only peers we know are contacted, and
+        // only at endpoints fit for ZeroTier traffic (ZeroTierOne
+        // `_doRENDEZVOUS`); anyone else could make us HELLO arbitrary hosts.
+        let Some(source) = PacketHeader::from_bytes(data).map(|h| h.source_address()) else {
+            return;
+        };
+        if !self.topology.roots.contains(&source)
+            || self.topology.get_peer(&rendezvous.peer_address).is_none()
+            || !rendezvous
+                .address
+                .to_socket_addr()
+                .is_some_and(|addr| self.should_use_path_for_zerotier_traffic(&addr))
+        {
+            return;
+        }
 
         tracing::info!(
             target: "manytier",
@@ -5022,10 +5037,16 @@ mod tests {
         node.identity.secret =
             Some(zerotier_crypto::identity::SecretKey::from_bytes(&secret_bytes).unwrap());
 
+        // RENDEZVOUS is only honoured from a root, for a peer we know.
+        let root_addr = node.topology.roots[0];
+        let other = test_identity(0x99);
+        let other_addr = *other.address.as_bytes();
+        node.topology.add_peer(other);
+
         // Build a fake RENDEZVOUS packet
         let rendezvous = RendezvousPayload {
             flags: 0,
-            peer_address: [0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            peer_address: other_addr,
             address: zerotier_protocol::inet_address::InetAddress::V4 {
                 ip: [10, 0, 0, 99],
                 port: 9993,
@@ -5038,7 +5059,7 @@ mod tests {
         let mut pkt = [0u8; 128];
         pkt[0..8].copy_from_slice(&1000u64.to_be_bytes()); // IV
         pkt[8..13].copy_from_slice(node.identity.address.as_bytes()); // dest = us
-        pkt[13..18].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]); // source
+        pkt[13..18].copy_from_slice(&root_addr); // source
         pkt[18] = 0; // flags
         pkt[27] = Verb::Rendezvous.to_byte();
         pkt[28..28 + payload_len].copy_from_slice(&payload_buf[..payload_len]);
@@ -6182,5 +6203,46 @@ mod tests {
         let mut packet = ok_packet(&peer, &our_addr, Verb::Whois, request, &body[..n], &secret);
         node.receive_packet(&mut packet, socket, 5_000);
         assert!(node.topology.get_peer(&learned_addr).is_none());
+    }
+
+    /// RENDEZVOUS from a peer that is not a root is ignored.
+    #[test]
+    fn rendezvous_from_non_root_is_ignored() {
+        let mut rng = XorShift17_11(0x5256);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+        let socket: SocketAddr = "203.0.113.52:9993".parse().unwrap();
+        let secret = [0x43; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x7b), socket, secret);
+        let other = test_identity(0x7c);
+        let other_addr = *other.address.as_bytes();
+        node.topology.add_peer(other);
+
+        let rendezvous = RendezvousPayload {
+            flags: 0,
+            peer_address: other_addr,
+            address: InetAddress::V4 {
+                ip: [198, 51, 100, 77],
+                port: 9993,
+            },
+        };
+        let mut body = [0u8; 64];
+        let n = rendezvous.serialize(&mut body);
+        let mut packet = crate::vl2::build_encrypted_verb_packet(
+            0x55,
+            &peer,
+            &our_addr,
+            Verb::Rendezvous,
+            &body[..n],
+            &secret,
+        )
+        .unwrap();
+        let actions = node.receive_packet(&mut packet, socket, 5_000);
+        assert!(
+            actions.is_empty(),
+            "non-root RENDEZVOUS must not trigger a HELLO"
+        );
     }
 }
