@@ -6,7 +6,7 @@
 /// directly performs I/O.
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -172,6 +172,34 @@ const ZT_MAX_NETWORK_CONFIG_SIZE: usize = 1_048_576;
 /// Upper bound on local endpoints advertised or probed per peer.
 const MAX_LOCAL_ADDRESSES: usize = 8;
 
+/// Packet IDs of the requests we sent that solicit an OK. Bounded like
+/// ZeroTier One's expecting-replies table (node/Node.hpp): the oldest
+/// entry is forgotten first.
+#[derive(Default)]
+struct ExpectedReplies {
+    order: VecDeque<u64>,
+    ids: BTreeSet<u64>,
+}
+
+impl ExpectedReplies {
+    const CAPACITY: usize = 8192;
+
+    fn insert(&mut self, packet_id: u64) {
+        if self.ids.insert(packet_id) {
+            self.order.push_back(packet_id);
+            if self.order.len() > Self::CAPACITY {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.ids.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, packet_id: u64) -> bool {
+        self.ids.contains(&packet_id)
+    }
+}
+
 pub struct Node {
     pub identity: Identity,
     /// Local UDP endpoints pushed to network peers (PUSH_DIRECT_PATHS).
@@ -196,6 +224,7 @@ pub struct Node {
     trusted_paths: BTreeMap<SocketAddr, u64>,
     /// Last RENDEZVOUS introduction per unordered peer pair.
     last_unite: BTreeMap<([u8; 5], [u8; 5]), u64>,
+    expected_replies: ExpectedReplies,
 }
 
 impl Node {
@@ -232,6 +261,7 @@ impl Node {
             pending_encrypted_packets: Vec::new(),
             trusted_paths: BTreeMap::new(),
             last_unite: BTreeMap::new(),
+            expected_replies: ExpectedReplies::default(),
         })
     }
 
@@ -249,6 +279,19 @@ impl Node {
             self.next_packet_id = 1;
         }
         packet_id
+    }
+
+    /// Allocate the ID of a request that expects an OK; only OKs referring
+    /// to such IDs are accepted.
+    pub fn allocate_request_id(&mut self) -> u64 {
+        let packet_id = self.allocate_packet_id();
+        self.expected_replies.insert(packet_id);
+        packet_id
+    }
+
+    /// Did we send a request with this packet ID (recently enough)?
+    pub fn expecting_reply_to(&self, packet_id: u64) -> bool {
+        self.expected_replies.contains(packet_id)
     }
 
     /// Join a virtual network by adding its membership state.
@@ -649,7 +692,7 @@ impl Node {
             .as_ref()
             .map(|p| p.timestamp)
             .unwrap_or(0);
-        let packet_id = self.allocate_packet_id();
+        let packet_id = self.allocate_request_id();
         let mut buf = [0u8; 512];
         if let Ok((len, _)) = RootManager::build_hello(
             &self.identity,
@@ -778,7 +821,7 @@ impl Node {
                 Some(secret) => secret,
                 None => continue,
             };
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, _packet_id)) = crate::root::RootManager::build_whois(
                 &self.identity,
@@ -1408,6 +1451,23 @@ impl Node {
             Ok(o) => o,
             Err(_) => return,
         };
+        // An OK must answer something we asked (ZeroTierOne _doOK checks
+        // expectingReplyTo); unsolicited ones could reset sessions, plant
+        // identities or inject configs.
+        if !self.expecting_reply_to(ok.in_re_packet_id) {
+            tracing::debug!(
+                target: "manytier",
+                event = "unsolicited_ok_dropped",
+                in_re_verb = ?ok.in_re_verb,
+                in_re_packet_id = ok.in_re_packet_id,
+                "OK does not answer a request we sent: dropping"
+            );
+            return;
+        }
+        let Some(ok_source) = PacketHeader::from_bytes(data_header).map(|h| h.source_address())
+        else {
+            return;
+        };
 
         match ok.sub_payload {
             OkSubPayload::Hello { timestamp_echo, .. } => {
@@ -1449,6 +1509,11 @@ impl Node {
                 }
             }
             OkSubPayload::Whois { identities } => {
+                // WHOIS goes to roots, and only their answers are trusted
+                // (upstream requires the peer to be upstream).
+                if !self.topology.roots.contains(&ok_source) {
+                    return;
+                }
                 // Add learned identities to topology and initiate HELLO
                 for id in identities {
                     if !self.identity_already_validated(&id) && !id.validate_address() {
@@ -1492,7 +1557,7 @@ impl Node {
                                     .as_ref()
                                     .map(|p| p.timestamp)
                                     .unwrap_or(0);
-                                let packet_id = self.allocate_packet_id();
+                                let packet_id = self.allocate_request_id();
                                 let mut hello_buf = [0u8; 512];
                                 if let Ok((len, _)) = RootManager::build_hello(
                                     &self.identity,
@@ -2201,7 +2266,7 @@ impl Node {
                     .as_ref()
                     .map(|p| p.timestamp)
                     .unwrap_or(0);
-                let packet_id = self.allocate_packet_id();
+                let packet_id = self.allocate_request_id();
                 let mut buf = [0u8; 512];
                 if let Ok((len, _)) = RootManager::build_hello(
                     &self.identity,
@@ -2567,7 +2632,7 @@ impl Node {
 
                 let mut payload = [0u8; 512];
                 let payload_len = req.serialize(&mut payload);
-                let packet_id = self.allocate_packet_id();
+                let packet_id = self.allocate_request_id();
                 if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
                     packet_id,
                     &our_address_bytes,
@@ -2734,7 +2799,7 @@ impl Node {
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
 
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, _packet_id)) = RootManager::build_hello(
                 &self.identity,
@@ -2792,7 +2857,7 @@ impl Node {
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
 
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, _packet_id)) = RootManager::build_hello(
                 &self.identity,
@@ -2841,7 +2906,7 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
@@ -2902,7 +2967,7 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
@@ -3035,7 +3100,7 @@ impl Node {
                     };
                     let mut payload = [0u8; 256];
                     let payload_len = gather.serialize(&mut payload);
-                    let packet_id = self.allocate_packet_id();
+                    let packet_id = self.allocate_request_id();
                     if let Some(packet) = crate::vl2::build_encrypted_verb_packet(
                         packet_id,
                         &our_address_bytes,
@@ -3101,7 +3166,7 @@ impl Node {
                 .as_ref()
                 .map(|p| p.timestamp)
                 .unwrap_or(0);
-            let packet_id = self.allocate_packet_id();
+            let packet_id = self.allocate_request_id();
             let mut buf = [0u8; 512];
             if let Ok((len, packet_id)) = RootManager::build_hello(
                 &self.identity,
@@ -4018,6 +4083,7 @@ mod tests {
         )
         .unwrap();
 
+        node.expected_replies.insert(0x0102_0304_0506_0708);
         let actions = node.receive_packet(&mut packet, controller_socket, 2000);
 
         assert!(actions.iter().any(|action| matches!(
@@ -4210,6 +4276,7 @@ mod tests {
             &shared_secret,
         );
 
+        node.expected_replies.insert(0x1112_1314_1516_1718);
         let actions = node.receive_packet(&mut packet, controller_socket, 2000);
 
         assert!(actions.iter().any(|action| matches!(
@@ -4732,6 +4799,7 @@ mod tests {
         )
         .expect("OK(WHOIS) packet should build");
 
+        node.expected_replies.insert(0x1112_1314_1516_1718);
         let actions = node.receive_packet(&mut ok_packet, root_socket, 3000);
 
         let replayed_request = actions
@@ -6028,5 +6096,91 @@ mod tests {
         );
         node.receive_packet(&mut packet, socket, 5_000);
         assert_eq!(status(&node), "NOT_FOUND");
+    }
+
+    fn ok_packet(
+        from_peer: &[u8; 5],
+        to: &[u8; 5],
+        in_re_verb: Verb,
+        in_re_packet_id: u64,
+        body: &[u8],
+        secret: &[u8; 48],
+    ) -> Vec<u8> {
+        let mut payload = vec![in_re_verb.to_byte()];
+        payload.extend_from_slice(&in_re_packet_id.to_be_bytes());
+        payload.extend_from_slice(body);
+        crate::vl2::build_encrypted_verb_packet(0x77, from_peer, to, Verb::Ok, &payload, secret)
+            .unwrap()
+    }
+
+    /// An OK(HELLO) that answers nothing we sent must not touch the peer's
+    /// session; the same OK answering our HELLO does.
+    #[test]
+    fn unsolicited_ok_is_ignored() {
+        let mut rng = XorShift17_11(0x4f4b);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+        let socket: SocketAddr = "203.0.113.50:9993".parse().unwrap();
+        let secret = [0x41; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x79), socket, secret);
+
+        let mut hello_ok_body = 4_000u64.to_be_bytes().to_vec(); // timestamp echo
+        hello_ok_body.extend_from_slice(&[11, 1, 14, 0, 2]); // versions + revision
+        let latency = |node: &Node| match node.topology.get_peer(&peer).unwrap().state {
+            PeerState::Active { latency_ms, .. } => latency_ms,
+            _ => u32::MAX,
+        };
+
+        let mut packet = ok_packet(
+            &peer,
+            &our_addr,
+            Verb::Hello,
+            0x1234,
+            &hello_ok_body,
+            &secret,
+        );
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert_eq!(
+            latency(&node),
+            10,
+            "unsolicited OK(HELLO) changed the session"
+        );
+
+        let request = node.allocate_request_id();
+        let mut packet = ok_packet(
+            &peer,
+            &our_addr,
+            Verb::Hello,
+            request,
+            &hello_ok_body,
+            &secret,
+        );
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert_eq!(latency(&node), 1_000);
+    }
+
+    /// OK(WHOIS) is only trusted from a root (upstream requires the peer to
+    /// be upstream), even when it answers a request we sent.
+    #[test]
+    fn whois_answers_from_non_roots_are_ignored() {
+        let mut rng = XorShift17_11(0x5748);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+        let socket: SocketAddr = "203.0.113.51:9993".parse().unwrap();
+        let secret = [0x42; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x7a), socket, secret);
+
+        let learned = Identity::generate(&mut rng).unwrap();
+        let learned_addr = *learned.address.as_bytes();
+        let mut body = [0u8; 128];
+        let n = zerotier_protocol::identity_wire::serialize_identity_public(&learned, &mut body);
+        let request = node.allocate_request_id();
+        let mut packet = ok_packet(&peer, &our_addr, Verb::Whois, request, &body[..n], &secret);
+        node.receive_packet(&mut packet, socket, 5_000);
+        assert!(node.topology.get_peer(&learned_addr).is_none());
     }
 }
