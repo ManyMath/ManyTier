@@ -18,6 +18,7 @@ pub struct Path {
     /// Measured latency in milliseconds (from HELLO round-trip).
     pub latency_ms: u32,
     pub is_direct: bool,
+    last_echo_request: u64,
 }
 
 impl Path {
@@ -29,7 +30,21 @@ impl Path {
             last_receive: now_ms,
             latency_ms: 0,
             is_direct: true,
+            last_echo_request: 0,
         }
+    }
+
+    /// Answer at most one ECHO per path per ZT_PEER_GENERAL_RATE_LIMIT / 6
+    /// (ZeroTierOne node/Path.hpp `rateGateEchoRequest`).
+    pub fn rate_gate_echo_request(&mut self, now_ms: u64) -> bool {
+        if self.last_echo_request != 0
+            && now_ms.saturating_sub(self.last_echo_request)
+                < zerotier_protocol::constants::ZT_PEER_GENERAL_RATE_LIMIT / 6
+        {
+            return false;
+        }
+        self.last_echo_request = now_ms;
+        true
     }
 
     /// Is this path alive? Alive = received within ZT_PEER_PATH_EXPIRATION (243s).

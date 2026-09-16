@@ -10,8 +10,9 @@ use core::net::SocketAddr;
 use zeroize::ZeroizeOnDrop;
 use zerotier_crypto::identity::Identity;
 use zerotier_protocol::{
-    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_GENERAL_RATE_LIMIT,
-    ZT_PEER_PING_PERIOD, ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
+    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_CREDENTIALS_RATE_LIMIT,
+    ZT_PEER_GENERAL_RATE_LIMIT, ZT_PEER_PING_PERIOD, ZT_PEER_WHOIS_RATE_LIMIT,
+    ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
 };
 
 use crate::path::Path;
@@ -113,6 +114,16 @@ impl PeerState {
     }
 }
 
+/// True (and `last` updated) when at least `interval_ms` has passed since
+/// `last`, or nothing was recorded yet.
+fn rate_gate(last: &mut u64, now_ms: u64, interval_ms: u64) -> bool {
+    if *last != 0 && now_ms.saturating_sub(*last) < interval_ms {
+        return false;
+    }
+    *last = now_ms;
+    true
+}
+
 /// A remote ZeroTier peer.
 #[derive(Debug)]
 pub struct Peer {
@@ -128,6 +139,8 @@ pub struct Peer {
     direct_path_push_cutoff_count: u8,
     /// Last ERROR(NEED_MEMBERSHIP_CERTIFICATE) we sent this peer.
     last_credentials_request: u64,
+    last_credentials_received: u64,
+    last_whois_request_received: u64,
 }
 
 impl Peer {
@@ -142,19 +155,40 @@ impl Peer {
             last_direct_path_push_receive: 0,
             direct_path_push_cutoff_count: 0,
             last_credentials_request: 0,
+            last_credentials_received: 0,
+            last_whois_request_received: 0,
         }
+    }
+
+    /// One NETWORK_CREDENTIALS per ZT_PEER_CREDENTIALS_RATE_LIMIT is
+    /// processed (ZeroTierOne `rateGateCredentialsReceived`): verifying them
+    /// costs signature checks.
+    pub fn rate_gate_credentials_received(&mut self, now_ms: u64) -> bool {
+        rate_gate(
+            &mut self.last_credentials_received,
+            now_ms,
+            ZT_PEER_CREDENTIALS_RATE_LIMIT,
+        )
+    }
+
+    /// One WHOIS request per ZT_PEER_WHOIS_RATE_LIMIT is answered for
+    /// non-roots (ZeroTierOne `rateGateInboundWhoisRequest`).
+    pub fn rate_gate_inbound_whois_request(&mut self, now_ms: u64) -> bool {
+        rate_gate(
+            &mut self.last_whois_request_received,
+            now_ms,
+            ZT_PEER_WHOIS_RATE_LIMIT,
+        )
     }
 
     /// At most one credentials request per peer per
     /// ZT_PEER_GENERAL_RATE_LIMIT, however many frames it sends meanwhile.
     pub fn rate_gate_credentials_request(&mut self, now_ms: u64) -> bool {
-        if self.last_credentials_request != 0
-            && now_ms.saturating_sub(self.last_credentials_request) < ZT_PEER_GENERAL_RATE_LIMIT
-        {
-            return false;
-        }
-        self.last_credentials_request = now_ms;
-        true
+        rate_gate(
+            &mut self.last_credentials_request,
+            now_ms,
+            ZT_PEER_GENERAL_RATE_LIMIT,
+        )
     }
 
     /// Rate gate for received PUSH_DIRECT_PATHS, as ZeroTierOne

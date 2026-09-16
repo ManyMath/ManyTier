@@ -166,6 +166,14 @@ pub const ZT_PEER_GENERAL_RATE_LIMIT: u64 = 1_000;
 /// (`ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT`).
 pub const ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT: u64 = 1_000;
 
+/// Minimum spacing of NETWORK_CREDENTIALS processed per peer
+/// (`ZT_PEER_CREDENTIALS_RATE_LIMIT`).
+pub const ZT_PEER_CREDENTIALS_RATE_LIMIT: u64 = 1_000;
+
+/// Minimum spacing of WHOIS requests answered per peer by a non-root
+/// (`ZT_PEER_WHOIS_RATE_LIMIT`).
+pub const ZT_PEER_WHOIS_RATE_LIMIT: u64 = 100;
+
 /// PUSH_DIRECT_PATHS record flag: forget this path (node/Packet.hpp).
 pub const PUSH_DIRECT_PATHS_FLAG_FORGET_PATH: u8 = 0x01;
 

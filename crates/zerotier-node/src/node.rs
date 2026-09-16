@@ -1810,6 +1810,18 @@ impl Node {
         } else {
             0
         };
+        let am_root = self
+            .topology
+            .roots
+            .contains(self.identity.address.as_bytes());
+        if !am_root
+            && !self
+                .topology
+                .get_peer_mut(&source)
+                .is_some_and(|peer| peer.rate_gate_inbound_whois_request(now_ms))
+        {
+            return;
+        }
 
         let mut known_identities = Vec::new();
         let mut unknown = Vec::new();
@@ -1871,7 +1883,7 @@ impl Node {
     ///
     /// The root server tells us to send a HELLO to a specific address to
     /// initiate a direct connection with another peer.
-    fn handle_echo(&mut self, data: &[u8], from: SocketAddr, _now_ms: u64, packet_id: u64) {
+    fn handle_echo(&mut self, data: &[u8], from: SocketAddr, now_ms: u64, packet_id: u64) {
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
         // Just echo the payload back in an OK(ECHO)
         let our_addr = *self.identity.address.as_bytes();
@@ -1879,6 +1891,17 @@ impl Node {
             Some(hdr) => hdr.source_address(),
             None => return,
         };
+        // One answer per path per ZT_PEER_GENERAL_RATE_LIMIT / 6, as
+        // ZeroTierOne's Path::rateGateEchoRequest, so ECHO cannot be used to
+        // reflect traffic.
+        let allowed = self
+            .topology
+            .get_peer_mut(&source)
+            .and_then(|peer| peer.paths.iter_mut().find(|path| path.address == from))
+            .is_some_and(|path| path.rate_gate_echo_request(now_ms));
+        if !allowed {
+            return;
+        }
 
         if self.identity.secret.is_some() {
             if let Some(shared_secret) = self.shared_secret_for_peer(&source) {
@@ -2197,12 +2220,19 @@ impl Node {
     /// peer's membership). Each COM issued to the sender for a network we
     /// have joined is recorded as that peer's COM; it is verified against the
     /// controller's key when the peer's frames are gated.
-    fn handle_network_credentials(&mut self, data: &[u8], _from: SocketAddr, _now_ms: u64) {
+    fn handle_network_credentials(&mut self, data: &[u8], _from: SocketAddr, now_ms: u64) {
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
         let source = match PacketHeader::from_bytes(data) {
             Some(hdr) => hdr.source_address(),
             None => return,
         };
+        let allowed = self
+            .topology
+            .get_peer_mut(&source)
+            .is_some_and(|peer| peer.rate_gate_credentials_received(now_ms));
+        if !allowed {
+            return;
+        }
         let Ok(creds) = NetworkCredentialsPayload::deserialize(payload_data) else {
             return;
         };
@@ -5654,7 +5684,9 @@ mod tests {
         net.our_com = Some(our_com.clone());
         node.networks.push(net);
 
-        let sender = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+        let sender_id = test_identity(0x0e);
+        let sender = *sender_id.address.as_bytes();
+        node.topology.add_peer(sender_id);
         let sender_com = build_signed_com(
             &signing_key,
             &controller_address,
@@ -6244,5 +6276,35 @@ mod tests {
             actions.is_empty(),
             "non-root RENDEZVOUS must not trigger a HELLO"
         );
+    }
+
+    /// ECHO is answered at most once per ZT_PEER_GENERAL_RATE_LIMIT / 6 per
+    /// path.
+    #[test]
+    fn echo_is_rate_limited_per_path() {
+        let mut rng = XorShift17_11(0x4543);
+        let id = Identity::generate(&mut rng).unwrap();
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(id, &planet, 1).unwrap();
+        let our_addr = *node.identity.address.as_bytes();
+        let socket: SocketAddr = "203.0.113.53:9993".parse().unwrap();
+        let secret = [0x44; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x7d), socket, secret);
+
+        let mut answered_at = |now_ms: u64| {
+            let mut packet = crate::vl2::build_encrypted_verb_packet(
+                now_ms,
+                &peer,
+                &our_addr,
+                Verb::Echo,
+                &[1, 2, 3, 4],
+                &secret,
+            )
+            .unwrap();
+            !node.receive_packet(&mut packet, socket, now_ms).is_empty()
+        };
+        assert!(answered_at(5_000));
+        assert!(!answered_at(5_100));
+        assert!(answered_at(5_200));
     }
 }
