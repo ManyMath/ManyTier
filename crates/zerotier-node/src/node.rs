@@ -436,59 +436,7 @@ impl Node {
 
                 // Extract managed routes from "RT" key
                 if let Some(rt_data) = dict.get_binary("RT") {
-                    let mut pos = 0;
-                    let mut new_routes = Vec::new();
-                    while pos < rt_data.len() {
-                        if let Ok((target, consumed)) = InetAddress::deserialize(&rt_data[pos..]) {
-                            pos += consumed;
-                            if pos + 2 > rt_data.len() {
-                                break;
-                            }
-                            let prefix = u16::from_be_bytes([rt_data[pos], rt_data[pos + 1]]);
-                            pos += 2;
-
-                            if pos >= rt_data.len() {
-                                break;
-                            }
-                            let via_type = rt_data[pos];
-                            pos += 1;
-
-                            if via_type == 4 {
-                                if pos + 4 + 2 <= rt_data.len() {
-                                    pos += 4 + 2; // skip port
-                                } else {
-                                    break;
-                                }
-                            } else if via_type == 6 {
-                                if pos + 16 + 2 <= rt_data.len() {
-                                    pos += 16 + 2; // skip port
-                                } else {
-                                    break;
-                                }
-                            }
-
-                            if pos + 2 <= rt_data.len() {
-                                pos += 2; // skip flags
-                            }
-
-                            let target_str = match target {
-                                InetAddress::V4 { ip, .. } => {
-                                    alloc::format!(
-                                        "{}.{}.{}.{}/{}",
-                                        ip[0],
-                                        ip[1],
-                                        ip[2],
-                                        ip[3],
-                                        prefix
-                                    )
-                                }
-                                _ => alloc::format!("{:?}/{}", target, prefix),
-                            };
-                            new_routes.push(crate::network::Route { target: target_str });
-                        } else {
-                            break;
-                        }
-                    }
+                    let new_routes = crate::network::parse_routes(rt_data);
                     if !new_routes.is_empty() {
                         net.routes = new_routes;
                     }

@@ -1104,6 +1104,7 @@ fn managed_ips_from_dict_data(dict_data: &[u8]) -> Vec<(std::net::IpAddr, u8)> {
     ips
 }
 
+/// Managed routes as (`target/prefix`, gateway) pairs.
 fn managed_routes_from_dict_data(dict_data: &[u8]) -> Vec<(String, Option<std::net::IpAddr>)> {
     let Some(data) = Dictionary::deserialize(dict_data)
         .ok()
@@ -1111,49 +1112,10 @@ fn managed_routes_from_dict_data(dict_data: &[u8]) -> Vec<(String, Option<std::n
     else {
         return Vec::new();
     };
-
-    let mut routes = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let Ok((target, target_consumed)) = InetAddress::deserialize(&data[pos..]) else {
-            break;
-        };
-        pos += target_consumed;
-
-        let Ok((via, via_consumed)) = InetAddress::deserialize(&data[pos..]) else {
-            break;
-        };
-        pos += via_consumed;
-
-        if pos + 2 > data.len() {
-            break;
-        }
-        pos += 2;
-
-        let Some(target_cidr) = inet_address_to_cidr(&target) else {
-            continue;
-        };
-        let gateway = inet_address_to_ip(&via);
-        routes.push((target_cidr, gateway));
-    }
-
-    routes
-}
-
-fn inet_address_to_cidr(address: &InetAddress) -> Option<String> {
-    match address {
-        InetAddress::Null => None,
-        InetAddress::V4 { ip, port } => Some(format!("{}/{}", std::net::Ipv4Addr::from(*ip), port)),
-        InetAddress::V6 { ip, port } => Some(format!("{}/{}", std::net::Ipv6Addr::from(*ip), port)),
-    }
-}
-
-fn inet_address_to_ip(address: &InetAddress) -> Option<std::net::IpAddr> {
-    match address {
-        InetAddress::Null => None,
-        InetAddress::V4 { ip, .. } => Some(std::net::IpAddr::V4((*ip).into())),
-        InetAddress::V6 { ip, .. } => Some(std::net::IpAddr::V6((*ip).into())),
-    }
+    zerotier_node::network::parse_routes(&data)
+        .into_iter()
+        .map(|route| (format!("{}/{}", route.target, route.prefix), route.via))
+        .collect()
 }
 
 fn tun_name_for_network(network_id: u64, local_zt_address: [u8; 5]) -> String {
@@ -1359,6 +1321,7 @@ mod tests {
             port: 64,
         }));
 
+        // ZeroTier One's layout: target, via, u16 flags, u16 metric.
         let mut route_bytes = Vec::new();
         route_bytes.extend_from_slice(&inet_bytes(InetAddress::V4 {
             ip: [10, 147, 20, 0],
@@ -1366,6 +1329,17 @@ mod tests {
         }));
         route_bytes.extend_from_slice(&inet_bytes(InetAddress::Null));
         route_bytes.extend_from_slice(&0u16.to_be_bytes());
+        route_bytes.extend_from_slice(&0u16.to_be_bytes());
+        route_bytes.extend_from_slice(&inet_bytes(InetAddress::V4 {
+            ip: [192, 168, 50, 0],
+            port: 24,
+        }));
+        route_bytes.extend_from_slice(&inet_bytes(InetAddress::V4 {
+            ip: [10, 147, 20, 1],
+            port: 0,
+        }));
+        route_bytes.extend_from_slice(&0u16.to_be_bytes());
+        route_bytes.extend_from_slice(&1u16.to_be_bytes());
 
         let mut dict = Dictionary::new();
         dict.add_binary("I", ip_bytes);
@@ -1381,6 +1355,15 @@ mod tests {
         assert_eq!(ips[1].0.to_string(), "fd00::7");
         assert_eq!(ips[1].1, 64);
 
-        assert_eq!(routes, vec![("10.147.20.0/24".to_string(), None)]);
+        assert_eq!(
+            routes,
+            vec![
+                ("10.147.20.0/24".to_string(), None),
+                (
+                    "192.168.50.0/24".to_string(),
+                    Some("10.147.20.1".parse().unwrap())
+                ),
+            ]
+        );
     }
 }

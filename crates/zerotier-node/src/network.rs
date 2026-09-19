@@ -26,10 +26,63 @@ pub struct NetworkMember {
     pub authorized: bool,
 }
 
-/// A route in a virtual network.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A managed route of a virtual network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Route {
-    pub target: alloc::string::String,
+    pub target: IpAddr,
+    pub prefix: u8,
+    /// Gateway, or `None` for an on-link route.
+    pub via: Option<IpAddr>,
+}
+
+impl Route {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.target, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => ipv4_in_prefix(ip, net, self.prefix),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => ipv6_in_prefix(ip, net, self.prefix),
+            _ => false,
+        }
+    }
+}
+
+/// Parse a config's `RT` value as ZeroTier One writes it
+/// (node/NetworkConfig.cpp): per route a target InetAddress whose port is
+/// the prefix length, a gateway InetAddress (null for on-link), then u16
+/// flags and u16 metric. Stops at the first malformed entry.
+pub fn parse_routes(data: &[u8]) -> Vec<Route> {
+    use zerotier_protocol::inet_address::InetAddress;
+
+    let ip = |address: &InetAddress| match address {
+        InetAddress::V4 { ip, port } => Some((IpAddr::V4(Ipv4Addr::from(*ip)), *port)),
+        InetAddress::V6 { ip, port } => Some((IpAddr::V6(Ipv6Addr::from(*ip)), *port)),
+        InetAddress::Null => None,
+    };
+    let mut routes = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Ok((target, used)) = InetAddress::deserialize(&data[pos..]) else {
+            break;
+        };
+        pos += used;
+        let Ok((via, used)) = InetAddress::deserialize(&data[pos..]) else {
+            break;
+        };
+        pos += used;
+        if pos + 4 > data.len() {
+            break;
+        }
+        pos += 4; // flags, metric
+        let Some((target, prefix)) = ip(&target) else {
+            continue;
+        };
+        let max_prefix = if target.is_ipv4() { 32 } else { 128 };
+        routes.push(Route {
+            target,
+            prefix: prefix.min(max_prefix) as u8,
+            via: ip(&via).map(|(gateway, _)| gateway),
+        });
+    }
+    routes
 }
 
 /// Why the controller refused us a config, as ZeroTier One tracks it
@@ -875,5 +928,30 @@ mod tests {
             authorized: true,
         });
         assert!(net.lookup_ipv6(addr6).is_some());
+    }
+
+    /// `RT` as ZeroTier One writes it: target (port = prefix), via (null
+    /// for on-link), u16 flags, u16 metric, repeated.
+    #[test]
+    fn parse_routes_reads_the_upstream_layout() {
+        let data = [
+            0x04, 10, 147, 20, 0, 0, 24,   // target 10.147.20.0/24
+            0x00, // on-link
+            0, 0, 0, 0, // flags, metric
+            0x04, 192, 168, 50, 0, 0, 24, // target 192.168.50.0/24
+            0x04, 10, 147, 20, 1, 0, 0, // via 10.147.20.1
+            0, 0, 0, 1, // flags, metric
+        ];
+        let routes = parse_routes(&data);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].target, IpAddr::V4(Ipv4Addr::new(10, 147, 20, 0)));
+        assert_eq!(routes[0].prefix, 24);
+        assert_eq!(routes[0].via, None);
+        assert_eq!(
+            routes[1].via,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 147, 20, 1)))
+        );
+        assert!(routes[1].contains(IpAddr::V4(Ipv4Addr::new(192, 168, 50, 9))));
+        assert!(!routes[1].contains(IpAddr::V4(Ipv4Addr::new(192, 168, 51, 9))));
     }
 }

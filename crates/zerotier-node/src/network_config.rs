@@ -197,8 +197,13 @@ impl NetworkMembership {
         let routes = config
             .routes
             .iter()
-            .map(|r| Route {
-                target: r.target.clone(),
+            .filter_map(|r| {
+                let (target, prefix) = r.target.split_once('/')?;
+                Some(Route {
+                    target: target.parse().ok()?,
+                    prefix: prefix.parse().ok()?,
+                    via: None,
+                })
             })
             .collect();
 
