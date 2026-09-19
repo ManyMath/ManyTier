@@ -8,6 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::SocketAddr;
 
+use core::net::IpAddr;
 use zerotier_crypto::salsa;
 use zerotier_protocol::constants::{
     CIPHER_SUITE_C25519_POLY1305_SALSA2012, FLAG_FRAGMENTED, ZT_DEFAULT_PHYSMTU,
@@ -471,11 +472,27 @@ pub fn process_outbound_frame(
                             now_ms,
                         );
                     }
-                    None => {
-                        unknown_destination = !dest_ip.is_multicast()
-                            && !dest_ip.is_broadcast()
-                            && !is_directed_broadcast_v4(network, dest_ip);
-                    }
+                    None => match network.gateway_for(IpAddr::V4(dest_ip)) {
+                        Some(Some(gateway)) => {
+                            let (member_address, member_mac) = (gateway.zt_address, gateway.mac);
+                            send_unicast_frame(
+                                node,
+                                &mut actions,
+                                network_id,
+                                (member_address, member_mac),
+                                our_mac,
+                                ethertype,
+                                payload,
+                                now_ms,
+                            );
+                        }
+                        Some(None) => unknown_destination = true,
+                        None => {
+                            unknown_destination = !dest_ip.is_multicast()
+                                && !dest_ip.is_broadcast()
+                                && !is_directed_broadcast_v4(network, dest_ip);
+                        }
+                    },
                 }
             }
         }
@@ -499,7 +516,23 @@ pub fn process_outbound_frame(
                             now_ms,
                         );
                     }
-                    None => unknown_destination = !dest_ip.is_multicast(),
+                    None => match network.gateway_for(IpAddr::V6(dest_ip)) {
+                        Some(Some(gateway)) => {
+                            let (member_address, member_mac) = (gateway.zt_address, gateway.mac);
+                            send_unicast_frame(
+                                node,
+                                &mut actions,
+                                network_id,
+                                (member_address, member_mac),
+                                our_mac,
+                                ethertype,
+                                payload,
+                                now_ms,
+                            );
+                        }
+                        Some(None) => unknown_destination = true,
+                        None => unknown_destination = !dest_ip.is_multicast(),
+                    },
                 }
             }
         }
@@ -1169,5 +1202,82 @@ mod tests {
         assert!(node.drain_actions().is_empty());
         handle_ext_frame(&mut node, &sender_address, &buf[..n], from, 3100, 79);
         assert_eq!(node.drain_actions().len(), 1);
+    }
+
+    /// A destination no member owns but a managed route covers goes to the
+    /// member that owns that route's gateway, via the most specific route.
+    #[test]
+    fn routed_destination_is_sent_to_the_gateway_member() {
+        use crate::network::Route;
+
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let gateway_id = test_identity(0x44);
+        let gateway_address = *gateway_id.address.as_bytes();
+        let path: SocketAddr = "10.0.0.20:9993".parse().unwrap();
+        let secret = [0x57; 48];
+        node.topology.add_peer(gateway_id);
+        {
+            let peer = node.topology.get_peer_mut(&gateway_address).unwrap();
+            peer.add_path(path, true, 1000);
+            peer.state = PeerState::new_active(secret, 10, 1000, 1000);
+        }
+        let net = node.find_network_mut(network_id).unwrap();
+        net.members.push(NetworkMember {
+            zt_address: gateway_address,
+            mac: ethernet::derive_mac(&gateway_address, network_id),
+            ipv4: Some((Ipv4Addr::new(10, 147, 20, 1), 24)),
+            ipv6: None,
+            authorized: true,
+        });
+        net.routes = vec![
+            Route {
+                target: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                prefix: 0,
+                via: Some(IpAddr::V4(Ipv4Addr::new(10, 147, 20, 99))),
+            },
+            Route {
+                target: IpAddr::V4(Ipv4Addr::new(192, 168, 50, 0)),
+                prefix: 24,
+                via: Some(IpAddr::V4(Ipv4Addr::new(10, 147, 20, 1))),
+            },
+        ];
+
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        packet[16..20].copy_from_slice(&[192, 168, 50, 9]);
+        let actions = process_outbound_frame(
+            &mut node,
+            network_id,
+            ethernet::ETHERTYPE_IPV4,
+            &packet,
+            &our_address,
+            2000,
+        );
+        let frames: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                NodeAction::SendTo { data, address } => {
+                    decrypted_verb(data, &secret).map(|(verb, _)| (verb, *address))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(frames.contains(&(Verb::ExtFrame, path)), "got {actions:?}");
+
+        // The default route's gateway is not a known member: refresh.
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        let actions = process_outbound_frame(
+            &mut node,
+            network_id,
+            ethernet::ETHERTYPE_IPV4,
+            &packet,
+            &our_address,
+            2000,
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, NodeAction::DestinationUnknown { .. })));
     }
 }

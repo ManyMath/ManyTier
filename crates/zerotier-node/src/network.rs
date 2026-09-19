@@ -173,6 +173,22 @@ impl NetworkMembership {
         }
     }
 
+    /// Where traffic for `ip` goes when no member owns it: the member that
+    /// owns the gateway of the most specific managed route covering `ip`.
+    /// `Some(None)` means such a route exists but its gateway is not in the
+    /// member directory yet.
+    pub fn gateway_for(&self, ip: IpAddr) -> Option<Option<&NetworkMember>> {
+        let route = self
+            .routes
+            .iter()
+            .filter(|route| route.via.is_some() && route.contains(ip))
+            .max_by_key(|route| route.prefix)?;
+        Some(match route.via? {
+            IpAddr::V4(gateway) => self.lookup_ipv4(gateway),
+            IpAddr::V6(gateway) => self.lookup_ipv6(gateway),
+        })
+    }
+
     pub fn lookup_ipv4(&self, ip: Ipv4Addr) -> Option<&NetworkMember> {
         self.members.iter().find(|m| {
             m.ipv4
