@@ -72,8 +72,18 @@ pub fn build_network_config(
     // id: issued-to ZT address as 10-char lowercase hex
     dict.add_text("id", &format_address(&member.node_id));
 
-    // f: flags as hex (0 for now)
-    dict.add_hex("f", 0);
+    // f: flags as hex. Members only accept broadcast when the config says
+    // so (ZT_NETWORKCONFIG_FLAG_ENABLE_BROADCAST, set by ZeroTier One's
+    // controller from enableBroadcast).
+    const FLAG_ENABLE_BROADCAST: u64 = 0x02;
+    dict.add_hex(
+        "f",
+        if network.enable_broadcast {
+            FLAG_ENABLE_BROADCAST
+        } else {
+            0
+        },
+    );
 
     // mtu: MTU as hex
     dict.add_int("mtu", network.mtu as u64);
@@ -455,7 +465,7 @@ mod tests {
         assert!(dict.get_text("ts").is_some()); // timestamp
         assert_eq!(dict.get_text("r"), Some("2a")); // 42 in hex
         assert_eq!(dict.get_text("id"), Some("a0b1c2d3e4"));
-        assert_eq!(dict.get_text("f"), Some("0"));
+        assert_eq!(dict.get_text("f"), Some("2")); // broadcast enabled
         assert_eq!(dict.get_text("mtu"), Some("af0"));
         assert_eq!(dict.get_text("ml"), Some("20")); // 32 in hex
     }
