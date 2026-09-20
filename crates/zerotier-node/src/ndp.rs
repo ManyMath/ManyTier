@@ -134,6 +134,25 @@ pub fn build_na(
     buf
 }
 
+/// An IPv6 packet carrying `payload` as `next_header`.
+pub fn ipv6_packet(
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    next_header: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(40 + payload.len());
+    packet.extend_from_slice(&[0x60, 0, 0, 0]);
+    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    packet.push(next_header);
+    packet.push(hop_limit);
+    packet.extend_from_slice(src);
+    packet.extend_from_slice(dst);
+    packet.extend_from_slice(payload);
+    packet
+}
+
 /// Build an ICMPv6 Router Advertisement with Prefix Information option.
 ///
 /// Returns the complete ICMPv6 body with correct checksum.

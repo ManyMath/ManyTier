@@ -23,6 +23,7 @@ use zerotier_protocol::verbs::ok::{OkPayload, OkSubPayload};
 
 use crate::arp;
 use crate::ethernet;
+use crate::ndp;
 use crate::node::{Node, NodeAction};
 
 /// Build a complete ZT packet containing an EXT_FRAME verb payload.
@@ -145,6 +146,18 @@ pub fn handle_frame(
     let src_mac = ethernet::derive_mac(sender_address, frame.network_id);
     let dest_mac = network.our_mac(node.identity.address.as_bytes());
 
+    if answer_address_resolution(
+        node,
+        frame.network_id,
+        sender_address,
+        src_mac,
+        frame.ethertype,
+        frame.payload,
+        now_ms,
+    ) {
+        return;
+    }
+
     node.push_action(NodeAction::FrameReceived {
         network_id: frame.network_id,
         src_mac,
@@ -188,6 +201,18 @@ pub fn handle_ext_frame(
             from,
             now_ms,
         );
+        return;
+    }
+
+    if answer_address_resolution(
+        node,
+        ext.network_id,
+        sender_address,
+        ext.src_mac,
+        ext.ethertype,
+        ext.payload,
+        now_ms,
+    ) {
         return;
     }
 
@@ -380,6 +405,18 @@ pub fn handle_multicast_frame(
     let src_mac = mf
         .source_mac
         .unwrap_or_else(|| ethernet::derive_mac(sender_address, mf.network_id));
+
+    if answer_address_resolution(
+        node,
+        mf.network_id,
+        sender_address,
+        src_mac,
+        mf.ethertype,
+        mf.payload,
+        now_ms,
+    ) {
+        return;
+    }
 
     node.push_action(NodeAction::FrameReceived {
         network_id: mf.network_id,
@@ -621,6 +658,98 @@ fn send_unicast_frame(
         );
         push_fragmented_send(actions, pkt, path_address, ZT_DEFAULT_PHYSMTU);
     }
+}
+
+/// Answer an ARP request or IPv6 neighbor solicitation for one of our own
+/// addresses. On an Ethernet tap the OS would; our TUN device is layer 3
+/// and never sees them, and without an answer an upstream member cannot
+/// reach us. Returns true when the frame was address resolution traffic,
+/// which has no use on the TUN device either way.
+#[allow(clippy::too_many_arguments)]
+fn answer_address_resolution(
+    node: &mut Node,
+    network_id: u64,
+    sender_address: &[u8; 5],
+    sender_mac: [u8; 6],
+    ethertype: u16,
+    payload: &[u8],
+    now_ms: u64,
+) -> bool {
+    let our_address = *node.identity.address.as_bytes();
+    let Some(network) = node.find_network(network_id) else {
+        return false;
+    };
+    let our_mac = network.our_mac(&our_address);
+    let (our_v4, our_v6) = network.our_ips(&our_address);
+
+    let (reply_to_mac, reply_ethertype, reply) = match ethertype {
+        ethernet::ETHERTYPE_ARP => {
+            let Some(request) = arp::ArpPacket::parse(payload) else {
+                return true;
+            };
+            let target = core::net::Ipv4Addr::from(request.target_proto);
+            if request.operation != arp::ARP_OP_REQUEST || !our_v4.contains(&target) {
+                return true;
+            }
+            let reply = arp::ArpPacket {
+                hw_type: 0x0001,
+                proto_type: 0x0800,
+                hw_len: 6,
+                proto_len: 4,
+                operation: arp::ARP_OP_REPLY,
+                sender_hw: our_mac,
+                sender_proto: request.target_proto,
+                target_hw: request.sender_hw,
+                target_proto: request.sender_proto,
+            };
+            let mut buf = [0u8; 28];
+            let n = reply.serialize(&mut buf);
+            (
+                request.sender_hw,
+                ethernet::ETHERTYPE_ARP,
+                buf[..n].to_vec(),
+            )
+        }
+        ethernet::ETHERTYPE_IPV6 => {
+            // A neighbor solicitation: ICMPv6 type 135 right after the
+            // fixed header, with the target address at offset 8.
+            if payload.len() < 64
+                || payload[6] != ndp::IPV6_NEXT_HEADER_ICMPV6
+                || payload[40] != ndp::ICMPV6_NS
+            {
+                return false;
+            }
+            let mut source = [0u8; 16];
+            source.copy_from_slice(&payload[8..24]);
+            let mut target = [0u8; 16];
+            target.copy_from_slice(&payload[48..64]);
+            // Duplicate address detection (unspecified source) is not ours
+            // to answer.
+            if source == [0u8; 16] || !our_v6.contains(&core::net::Ipv6Addr::from(target)) {
+                return true;
+            }
+            let na = ndp::build_na(&target, &our_mac, true, true, &target, &source);
+            let packet = ndp::ipv6_packet(&target, &source, ndp::IPV6_NEXT_HEADER_ICMPV6, 255, &na);
+            (sender_mac, ethernet::ETHERTYPE_IPV6, packet)
+        }
+        _ => return false,
+    };
+
+    let mut actions = Vec::new();
+    send_unicast_frame(
+        node,
+        &mut actions,
+        network_id,
+        (*sender_address, reply_to_mac),
+        our_mac,
+        reply_ethertype,
+        &reply,
+        now_ms,
+    );
+    for action in actions {
+        node.push_action(action);
+    }
+    true
 }
 
 /// Directed broadcast of any member's IPv4 prefix.
@@ -1296,5 +1425,182 @@ mod tests {
         assert!(actions
             .iter()
             .any(|action| matches!(action, NodeAction::DestinationUnknown { .. })));
+    }
+
+    /// A network with our address in the directory, plus an authenticated
+    /// peer holding a valid COM, for address resolution tests.
+    fn resolution_env(
+        our_v4: Ipv4Addr,
+        our_v6: core::net::Ipv6Addr,
+    ) -> (Node, u64, [u8; 5], SocketAddr, [u8; 48]) {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, signing_key, controller_address) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let peer_id = test_identity(0x45);
+        let peer_address = *peer_id.address.as_bytes();
+        let path: SocketAddr = "10.0.0.30:9993".parse().unwrap();
+        let secret = [0x58; 48];
+        node.topology.add_peer(peer_id);
+        {
+            let peer = node.topology.get_peer_mut(&peer_address).unwrap();
+            peer.add_path(path, true, 1000);
+            peer.state = PeerState::new_active(secret, 10, 1000, 1000);
+        }
+        add_peer_com(
+            &mut node,
+            network_id,
+            &signing_key,
+            &controller_address,
+            &peer_address,
+        );
+        node.find_network_mut(network_id)
+            .unwrap()
+            .members
+            .push(NetworkMember {
+                zt_address: our_address,
+                mac: ethernet::derive_mac(&our_address, network_id),
+                ipv4: Some((our_v4, 24)),
+                ipv6: Some((our_v6, 64)),
+                authorized: true,
+            });
+        (node, network_id, peer_address, path, secret)
+    }
+
+    fn multicast_frame_bytes(
+        network_id: u64,
+        mac: [u8; 6],
+        adi: u32,
+        ethertype: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let frame = MulticastFramePayload {
+            network_id,
+            flags: 0,
+            gather_limit: None,
+            source_mac: None,
+            dest_mac: mac,
+            adi,
+            ethertype,
+            payload,
+        };
+        let mut buf = vec![0u8; 64 + payload.len()];
+        let n = frame.serialize(&mut buf);
+        buf.truncate(n);
+        buf
+    }
+
+    /// Upstream members find us by ARP: an ARP request for our IPv4 address,
+    /// multicast to our resolution group, is answered with a unicast reply
+    /// carrying our MAC, and is not handed to the TUN device.
+    #[test]
+    fn arp_request_for_our_address_is_answered() {
+        let our_v4 = Ipv4Addr::new(10, 147, 20, 5);
+        let (mut node, network_id, peer, path, secret) =
+            resolution_env(our_v4, "fd00::5".parse().unwrap());
+        let our_mac = node
+            .find_network(network_id)
+            .unwrap()
+            .our_mac(node.identity.address.as_bytes());
+        let peer_mac = ethernet::derive_mac(&peer, network_id);
+        let request = arp::ArpPacket {
+            hw_type: 1,
+            proto_type: 0x0800,
+            hw_len: 6,
+            proto_len: 4,
+            operation: arp::ARP_OP_REQUEST,
+            sender_hw: peer_mac,
+            sender_proto: [10, 147, 20, 7],
+            target_hw: [0; 6],
+            target_proto: our_v4.octets(),
+        };
+        let mut arp_buf = [0u8; 28];
+        request.serialize(&mut arp_buf);
+        let payload =
+            multicast_frame_bytes(network_id, [0xff; 6], u32::from(our_v4), 0x0806, &arp_buf);
+
+        handle_multicast_frame(&mut node, &peer, &payload, path, 2000, 1);
+        let actions = node.drain_actions();
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::FrameReceived { .. })));
+        let reply = actions
+            .iter()
+            .find_map(|a| match a {
+                NodeAction::SendTo { data, address } if *address == path => {
+                    decrypted_verb(data, &secret).filter(|(verb, _)| *verb == Verb::ExtFrame)
+                }
+                _ => None,
+            })
+            .expect("ARP reply EXT_FRAME");
+        let ext = ExtFramePayload::parse(&reply.1).unwrap();
+        assert_eq!(ext.dest_mac, peer_mac);
+        assert_eq!(ext.src_mac, our_mac);
+        assert_eq!(ext.ethertype, 0x0806);
+        let answer = arp::ArpPacket::parse(ext.payload).unwrap();
+        assert_eq!(answer.operation, arp::ARP_OP_REPLY);
+        assert_eq!(answer.sender_hw, our_mac);
+        assert_eq!(answer.sender_proto, our_v4.octets());
+        assert_eq!(answer.target_proto, [10, 147, 20, 7]);
+
+        // A request for someone else's address is not answered.
+        let mut other = request;
+        other.target_proto = [10, 147, 20, 8];
+        other.serialize(&mut arp_buf);
+        let payload = multicast_frame_bytes(network_id, [0xff; 6], 0, 0x0806, &arp_buf);
+        handle_multicast_frame(&mut node, &peer, &payload, path, 2100, 2);
+        assert!(node.drain_actions().is_empty());
+    }
+
+    /// A neighbor solicitation for our IPv6 address is answered with a
+    /// solicited, override neighbor advertisement with a valid checksum.
+    #[test]
+    fn neighbor_solicitation_for_our_address_is_answered() {
+        let our_v6: core::net::Ipv6Addr = "fd00::1:2:5".parse().unwrap();
+        let (mut node, network_id, peer, path, secret) =
+            resolution_env(Ipv4Addr::new(10, 147, 20, 5), our_v6);
+        let peer_v6: [u8; 16] = "fd00::1:2:7"
+            .parse::<core::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let target = our_v6.octets();
+        let mut ns = vec![ndp::ICMPV6_NS, 0, 0, 0, 0, 0, 0, 0];
+        ns.extend_from_slice(&target);
+        let solicited_node = [
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, target[13], target[14], target[15],
+        ];
+        let checksum = ndp::icmpv6_checksum(&peer_v6, &solicited_node, &ns);
+        ns[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let packet = ndp::ipv6_packet(&peer_v6, &solicited_node, 58, 255, &ns);
+        let group = [0x33, 0x33, 0xff, target[13], target[14], target[15]];
+        let payload = multicast_frame_bytes(network_id, group, 0, 0x86dd, &packet);
+
+        handle_multicast_frame(&mut node, &peer, &payload, path, 2000, 1);
+        let actions = node.drain_actions();
+        let reply = actions
+            .iter()
+            .find_map(|a| match a {
+                NodeAction::SendTo { data, .. } => {
+                    decrypted_verb(data, &secret).filter(|(verb, _)| *verb == Verb::ExtFrame)
+                }
+                _ => None,
+            })
+            .expect("NA EXT_FRAME");
+        let ext = ExtFramePayload::parse(&reply.1).unwrap();
+        assert_eq!(ext.ethertype, 0x86dd);
+        let ipv6 = ext.payload;
+        assert_eq!(&ipv6[8..24], &target);
+        assert_eq!(&ipv6[24..40], &peer_v6);
+        assert_eq!(ipv6[7], 255);
+        let na = &ipv6[40..];
+        assert_eq!(na[0], ndp::ICMPV6_NA);
+        assert_eq!(na[4] & 0x60, 0x60, "solicited and override");
+        assert_eq!(&na[8..24], &target);
+        let mut zeroed = na.to_vec();
+        zeroed[2] = 0;
+        zeroed[3] = 0;
+        assert_eq!(
+            ndp::icmpv6_checksum(&target, &peer_v6, &zeroed).to_be_bytes(),
+            [na[2], na[3]]
+        );
     }
 }
