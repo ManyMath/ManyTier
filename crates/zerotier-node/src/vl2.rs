@@ -249,10 +249,26 @@ pub fn handle_multicast_gather(
         Err(_) => return,
     };
 
+    // Like ZeroTier One's Multicaster::gather: ourselves first if we are in
+    // the group, then the members we know of, never the asker itself.
     let limit = gather.gather_limit as usize;
-    let subscribers =
-        node.multicast_manager
-            .get_subscribers(gather.network_id, &gather.mac, gather.adi, limit);
+    let our_address = *node.identity.address.as_bytes();
+    let we_subscribe = node.find_network(gather.network_id).is_some_and(|net| {
+        net.multicast_groups
+            .iter()
+            .any(|group| group.mac == gather.mac && group.adi == gather.adi)
+    });
+    let mut subscribers = Vec::new();
+    if we_subscribe && limit > 0 {
+        subscribers.push(our_address);
+    }
+    subscribers.extend(node.multicast_manager.get_replication_targets(
+        gather.network_id,
+        &gather.mac,
+        gather.adi,
+        sender_address,
+        limit.saturating_sub(subscribers.len()),
+    ));
 
     // Upstream sends no OK when nothing was gathered (ZeroTierOne
     // node/IncomingPacket.cpp _doMULTICAST_GATHER).
@@ -267,7 +283,8 @@ pub fn handle_multicast_gather(
     let total_known = node
         .multicast_manager
         .get_subscribers(gather.network_id, &gather.mac, gather.adi, usize::MAX)
-        .len() as u32;
+        .len() as u32
+        + u32::from(we_subscribe);
     let count = subscribers.len() as u16;
     let response_len = 24 + subscribers.len() * 5;
     let mut response = Vec::with_capacity(response_len);

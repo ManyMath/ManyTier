@@ -8,8 +8,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use zerotier_protocol::verbs::multicast::{MulticastGroup, MulticastLikePayload};
 
-use crate::ethernet::ETHERTYPE_ARP;
-
 /// Key identifying a multicast group on a specific network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MulticastGroupKey {
@@ -225,17 +223,6 @@ impl MulticastManager {
     }
 }
 
-/// Create the ARP multicast group key for a network.
-///
-/// ARP uses broadcast MAC (ff:ff:ff:ff:ff:ff) with ETHERTYPE_ARP as the ADI.
-pub fn arp_multicast_group(network_id: u64) -> MulticastGroupKey {
-    MulticastGroupKey {
-        network_id,
-        mac: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-        adi: ETHERTYPE_ARP as u32,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,14 +309,6 @@ mod tests {
         let like = mgr.build_multicast_like(1, &addr);
         assert_eq!(like.groups.len(), 2, "should only include network 1 groups");
         assert!(like.groups.iter().all(|g| g.network_id == 1));
-    }
-
-    #[test]
-    fn arp_multicast_group_correct() {
-        let group = arp_multicast_group(0xaabbccdd11223344);
-        assert_eq!(group.network_id, 0xaabbccdd11223344);
-        assert_eq!(group.mac, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        assert_eq!(group.adi, ETHERTYPE_ARP as u32);
     }
 
     #[test]

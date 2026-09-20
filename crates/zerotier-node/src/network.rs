@@ -12,6 +12,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use zerotier_protocol::verbs::network_config::{CertificateOfMembership, ComQualifier};
 
 use crate::ethernet;
+use crate::multicast::MulticastGroupKey;
 
 pub const COM_QUALIFIER_TIMESTAMP_ID: u64 = 0;
 pub const COM_REFRESH_MARGIN_CAP_MS: u64 = 60_000;
@@ -115,6 +116,11 @@ pub struct NetworkMembership {
     /// When our credentials were last pushed to each peer. Cleared when a
     /// new config arrives so every peer gets the new COM.
     pub credentials_pushed: BTreeMap<[u8; 5], u64>,
+    /// Whether the config enables Ethernet broadcast
+    /// (ZT_NETWORKCONFIG_FLAG_ENABLE_BROADCAST).
+    pub broadcast_enabled: bool,
+    /// The multicast groups we announce with MULTICAST_LIKE.
+    pub multicast_groups: Vec<MulticastGroupKey>,
 }
 
 impl NetworkMembership {
@@ -135,7 +141,57 @@ impl NetworkMembership {
             last_multicast_gather: 0,
             config_failure: ConfigFailure::None,
             credentials_pushed: BTreeMap::new(),
+            broadcast_enabled: true,
+            multicast_groups: Vec::new(),
         }
+    }
+
+    /// Our own IPv4 and IPv6 addresses on this network.
+    pub fn our_ips(&self, our_address: &[u8; 5]) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+        let mut v4: Vec<Ipv4Addr> = self.assigned_ipv4.into_iter().collect();
+        let mut v6: Vec<Ipv6Addr> = self.assigned_ipv6.into_iter().collect();
+        if let Some(us) = self.members.iter().find(|m| m.zt_address == *our_address) {
+            v4.extend(us.ipv4.map(|(ip, _)| ip));
+            v6.extend(us.ipv6.map(|(ip, _)| ip));
+        }
+        v4.sort();
+        v4.dedup();
+        v6.sort();
+        v6.dedup();
+        (v4, v6)
+    }
+
+    /// The groups ZeroTier One subscribes for a member with our addresses
+    /// (node/Network.cpp `_allMulticastGroups`, plus the address resolution
+    /// groups its taps add): per IPv4 address the broadcast MAC with the
+    /// address as ADI (how ARP finds us), per IPv6 address its
+    /// solicited-node group, and broadcast when the network allows it.
+    pub fn wanted_multicast_groups(&self, our_address: &[u8; 5]) -> Vec<MulticastGroupKey> {
+        let (v4, v6) = self.our_ips(our_address);
+        let mut groups: Vec<MulticastGroupKey> = v4
+            .iter()
+            .map(|ip| MulticastGroupKey {
+                network_id: self.network_id,
+                mac: [0xff; 6],
+                adi: u32::from(*ip),
+            })
+            .chain(v6.iter().map(|ip| {
+                let o = ip.octets();
+                MulticastGroupKey {
+                    network_id: self.network_id,
+                    mac: [0x33, 0x33, 0xff, o[13], o[14], o[15]],
+                    adi: 0,
+                }
+            }))
+            .collect();
+        if self.broadcast_enabled {
+            groups.push(MulticastGroupKey {
+                network_id: self.network_id,
+                mac: [0xff; 6],
+                adi: 0,
+            });
+        }
+        groups
     }
 
     /// Network status as ZeroTier One names it (`ZT_VirtualNetworkStatus`).

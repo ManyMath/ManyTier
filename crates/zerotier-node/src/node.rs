@@ -33,7 +33,7 @@ use zerotier_protocol::verbs::whois::WhoisRequest;
 use zerotier_protocol::{is_fragment, FragmentHeader, PacketHeader, ProtocolError};
 
 use crate::controller::dictionary::Dictionary;
-use crate::multicast::{arp_multicast_group, MulticastGroupKey, MulticastManager};
+use crate::multicast::{MulticastGroupKey, MulticastManager};
 use crate::network::{ConfigFailure, NetworkMember, NetworkMembership};
 use crate::peer::PeerState;
 use crate::root::RootManager;
@@ -169,6 +169,9 @@ const ZT_PENDING_ENCRYPTED_PACKET_TTL_MS: u64 = 30_000;
 const ZT_MAX_NETWORK_CONFIG_SIZE: usize = 1_048_576;
 
 /// The main ZeroTier VL1 node engine.
+/// ZT_NETWORKCONFIG_FLAG_ENABLE_BROADCAST in a config's `f` value.
+const NETWORK_CONFIG_FLAG_ENABLE_BROADCAST: u64 = 0x02;
+
 /// Upper bound on local endpoints advertised or probed per peer.
 const MAX_LOCAL_ADDRESSES: usize = 8;
 
@@ -305,16 +308,22 @@ impl Node {
             return;
         }
 
-        let our_address = *self.identity.address.as_bytes();
-        let arp_group = arp_multicast_group(membership.network_id);
-        self.multicast_manager.subscribe(
-            arp_group.network_id,
-            arp_group.mac,
-            arp_group.adi,
-            our_address,
-            0,
-        );
+        let network_id = membership.network_id;
         self.networks.push(membership);
+        self.refresh_multicast_groups(network_id);
+    }
+
+    /// Recompute the groups we announce for a network after our addresses
+    /// or its flags changed, and announce them on the next tick if they did.
+    fn refresh_multicast_groups(&mut self, network_id: u64) {
+        let our_address = *self.identity.address.as_bytes();
+        if let Some(net) = self.find_network_mut(network_id) {
+            let groups = net.wanted_multicast_groups(&our_address);
+            if groups != net.multicast_groups {
+                net.multicast_groups = groups;
+                net.last_multicast_like = 0;
+            }
+        }
     }
 
     pub fn find_network(&self, network_id: u64) -> Option<&NetworkMembership> {
@@ -2017,11 +2026,17 @@ impl Node {
             "NETWORK_CONFIG received"
         );
         self.apply_network_config(nc.network_id, &nc.dict_data);
+        let broadcast_enabled = Dictionary::deserialize(&nc.dict_data)
+            .ok()
+            .and_then(|dict| dict.get_hex_u64("f"))
+            .is_some_and(|flags| flags & NETWORK_CONFIG_FLAG_ENABLE_BROADCAST != 0);
         if let Some(net) = self.find_network_mut(nc.network_id) {
             net.pending_config_request = false;
             net.config_failure = ConfigFailure::None;
             net.credentials_pushed.clear();
+            net.broadcast_enabled = broadcast_enabled;
         }
+        self.refresh_multicast_groups(nc.network_id);
         self.actions.push(NodeAction::NetworkConfigured {
             network_id: nc.network_id,
             dict_data: nc.dict_data,
@@ -3006,9 +3021,7 @@ impl Node {
         #[allow(clippy::type_complexity)]
         let mut due_gathers: Vec<(usize, u64, Vec<[u8; 5]>, Vec<MulticastGroupKey>)> = Vec::new();
         for (index, net) in self.networks.iter().enumerate() {
-            let local_groups = self
-                .multicast_manager
-                .groups_for_subscriber(net.network_id, &our_address_bytes);
+            let local_groups = net.multicast_groups.clone();
             if local_groups.is_empty() {
                 continue;
             }
@@ -3034,9 +3047,19 @@ impl Node {
         let mut unresolved_multicast = BTreeSet::new();
         for (index, network_id, peer_addresses) in due_likes {
             self.networks[index].last_multicast_like = now_ms;
-            let like = self
-                .multicast_manager
-                .build_multicast_like(network_id, &our_address_bytes);
+            let like = zerotier_protocol::verbs::multicast::MulticastLikePayload {
+                groups: self.networks[index]
+                    .multicast_groups
+                    .iter()
+                    .map(
+                        |group| zerotier_protocol::verbs::multicast::MulticastGroup {
+                            network_id,
+                            mac: group.mac,
+                            adi: group.adi,
+                        },
+                    )
+                    .collect(),
+            };
             let mut payload = vec![0u8; like.groups.len() * 18];
             let payload_len = like.serialize(&mut payload);
             payload.truncate(payload_len);
@@ -4968,9 +4991,7 @@ mod tests {
         }
 
         let node_b_subscribers = node_b.multicast_manager.get_subscribers(
-            network_id,
-            &[0xff; 6],
-            ethernet::ETHERTYPE_ARP as u32,
+            network_id, &[0xff; 6], 0, // the broadcast group
             10,
         );
         assert!(
@@ -4990,9 +5011,7 @@ mod tests {
         }
 
         let node_a_subscribers = node_a.multicast_manager.get_subscribers(
-            network_id,
-            &[0xff; 6],
-            ethernet::ETHERTYPE_ARP as u32,
+            network_id, &[0xff; 6], 0, // the broadcast group
             10,
         );
         assert!(
@@ -6254,5 +6273,51 @@ mod tests {
         assert!(answered_at(5_000));
         assert!(!answered_at(5_100));
         assert!(answered_at(5_200));
+    }
+
+    /// We announce the groups an upstream member with our addresses would:
+    /// the broadcast MAC with each IPv4 address as ADI (ARP), the
+    /// solicited-node group of each IPv6 address (NDP), and broadcast. They
+    /// are ours, so they never expire with peers' subscriptions.
+    #[test]
+    fn announced_groups_follow_our_addresses_and_do_not_expire() {
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let our_address = *node.identity.address.as_bytes();
+        let peer_socket: SocketAddr = "10.0.0.2:9993".parse().unwrap();
+        let secret = [0x34; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x02), peer_socket, secret);
+
+        let network_id = 0xfe00000000abcdef;
+        let mut membership = make_membership_with_peer(network_id, our_address, peer);
+        let our_v6: Ipv6Addr = "fd00::1:2:3".parse().unwrap();
+        membership.members.retain(|m| m.zt_address != our_address);
+        membership.members.push(NetworkMember {
+            zt_address: our_address,
+            mac: ethernet::derive_mac(&our_address, network_id),
+            ipv4: Some((Ipv4Addr::new(10, 147, 20, 5), 24)),
+            ipv6: Some((our_v6, 64)),
+            authorized: true,
+        });
+        node.join_network(membership);
+
+        let groups = &node.find_network(network_id).unwrap().multicast_groups;
+        let has = |mac: [u8; 6], adi: u32| groups.iter().any(|g| g.mac == mac && g.adi == adi);
+        assert!(has([0xff; 6], u32::from(Ipv4Addr::new(10, 147, 20, 5))));
+        assert!(has([0x33, 0x33, 0xff, 0x02, 0x00, 0x03], 0));
+        assert!(has([0xff; 6], 0));
+
+        // Past the 90 s subscription expiry, the LIKE still carries them.
+        let actions = node.tick(100_000);
+        let liked = actions.iter().any(|action| match action {
+            NodeAction::SendTo { data, address } if *address == peer_socket => {
+                let mut packet = data.clone();
+                salsa::dearmor_packet(&secret, &mut packet).is_ok()
+                    && Verb::from_byte(packet[27] & 0x1f) == Some(Verb::MulticastLike)
+                    && packet[28..].len() == 18 * 3
+            }
+            _ => false,
+        });
+        assert!(liked, "MULTICAST_LIKE with our three groups expected");
     }
 }

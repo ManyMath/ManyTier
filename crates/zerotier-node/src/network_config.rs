@@ -222,6 +222,8 @@ impl NetworkMembership {
             last_multicast_gather: 0,
             config_failure: Default::default(),
             credentials_pushed: Default::default(),
+            broadcast_enabled: true,
+            multicast_groups: Vec::new(),
         })
     }
 }
