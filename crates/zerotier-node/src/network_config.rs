@@ -224,6 +224,11 @@ impl NetworkMembership {
             credentials_pushed: Default::default(),
             broadcast_enabled: true,
             multicast_groups: Vec::new(),
+            multicast_limit: if config.multicast_limit > 0 {
+                config.multicast_limit
+            } else {
+                crate::network::DEFAULT_MULTICAST_LIMIT
+            },
         })
     }
 }

@@ -86,6 +86,9 @@ pub fn parse_routes(data: &[u8]) -> Vec<Route> {
     routes
 }
 
+/// ZeroTier One's default `multicastLimit`.
+pub const DEFAULT_MULTICAST_LIMIT: u32 = 32;
+
 /// Why the controller refused us a config, as ZeroTier One tracks it
 /// (`Network::_netconfFailure`). Cleared when a config is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -121,6 +124,8 @@ pub struct NetworkMembership {
     pub broadcast_enabled: bool,
     /// The multicast groups we announce with MULTICAST_LIKE.
     pub multicast_groups: Vec<MulticastGroupKey>,
+    /// Most recipients one multicast is sent to (config `ml`).
+    pub multicast_limit: u32,
 }
 
 impl NetworkMembership {
@@ -143,6 +148,7 @@ impl NetworkMembership {
             credentials_pushed: BTreeMap::new(),
             broadcast_enabled: true,
             multicast_groups: Vec::new(),
+            multicast_limit: DEFAULT_MULTICAST_LIMIT,
         }
     }
 

@@ -2026,15 +2026,22 @@ impl Node {
             "NETWORK_CONFIG received"
         );
         self.apply_network_config(nc.network_id, &nc.dict_data);
-        let broadcast_enabled = Dictionary::deserialize(&nc.dict_data)
-            .ok()
+        let dict = Dictionary::deserialize(&nc.dict_data).ok();
+        let broadcast_enabled = dict
+            .as_ref()
             .and_then(|dict| dict.get_hex_u64("f"))
             .is_some_and(|flags| flags & NETWORK_CONFIG_FLAG_ENABLE_BROADCAST != 0);
+        let multicast_limit = dict
+            .as_ref()
+            .and_then(|dict| dict.get_hex_u64("ml"))
+            .and_then(|limit| u32::try_from(limit).ok())
+            .unwrap_or(crate::network::DEFAULT_MULTICAST_LIMIT);
         if let Some(net) = self.find_network_mut(nc.network_id) {
             net.pending_config_request = false;
             net.config_failure = ConfigFailure::None;
             net.credentials_pushed.clear();
             net.broadcast_enabled = broadcast_enabled;
+            net.multicast_limit = multicast_limit;
         }
         self.refresh_multicast_groups(nc.network_id);
         self.actions.push(NodeAction::NetworkConfigured {

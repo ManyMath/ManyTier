@@ -471,40 +471,20 @@ pub fn process_outbound_frame(
                     return actions;
                 }
             }
-            // Not resolved locally -- send as multicast to ARP group
-            // Build EXT_FRAME to broadcast MAC
-            let dest_mac = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-            let ext = ExtFramePayload {
-                network_id,
-                flags: 0,
-                dest_mac,
-                src_mac: our_mac,
-                ethertype,
-                payload,
-            };
-            let mut buf = [0u8; 2048];
-            let n = ext.serialize(&mut buf);
-            // For multicast, we'd need to send to all known subscribers.
-            // For now, build a single SendTo action (the transport layer
-            // would need to handle multicast distribution).
-            let targets = node.multicast_manager.get_replication_targets(
-                network_id,
-                &dest_mac,
-                ethernet::ETHERTYPE_ARP as u32,
-                our_zt_address,
-                64,
-            );
-            for target_addr in &targets {
-                // We'd need to look up the target's physical address from topology.
-                // For now, push the frame data -- the caller resolves physical addresses.
-                if let Some(peer) = node.topology.get_peer(target_addr) {
-                    if let Some(path) = peer.best_path(now_ms) {
-                        actions.push(NodeAction::SendTo {
-                            data: buf[..n].to_vec(),
-                            address: path.address,
-                        });
-                    }
-                }
+            // Not resolved locally: multicast it to the group the target's
+            // owner subscribes for ARP (broadcast MAC, the address as ADI).
+            if payload.len() >= 28 {
+                let target =
+                    u32::from_be_bytes([payload[24], payload[25], payload[26], payload[27]]);
+                send_multicast_frame(
+                    node,
+                    &mut actions,
+                    network_id,
+                    ([0xff; 6], target),
+                    ethertype,
+                    payload,
+                    now_ms,
+                );
             }
         }
         ethernet::ETHERTYPE_IPV4 => {
@@ -542,9 +522,28 @@ pub fn process_outbound_frame(
                         }
                         Some(None) => unknown_destination = true,
                         None => {
-                            unknown_destination = !dest_ip.is_multicast()
-                                && !dest_ip.is_broadcast()
-                                && !is_directed_broadcast_v4(network, dest_ip);
+                            let broadcast = dest_ip.is_broadcast()
+                                || is_directed_broadcast_v4(network, dest_ip);
+                            let group = if dest_ip.is_multicast() {
+                                let o = dest_ip.octets();
+                                Some(([0x01, 0x00, 0x5e, o[1] & 0x7f, o[2], o[3]], 0))
+                            } else if broadcast && network.broadcast_enabled {
+                                Some(([0xff; 6], 0))
+                            } else {
+                                None
+                            };
+                            unknown_destination = !dest_ip.is_multicast() && !broadcast;
+                            if let Some(group) = group {
+                                send_multicast_frame(
+                                    node,
+                                    &mut actions,
+                                    network_id,
+                                    group,
+                                    ethertype,
+                                    payload,
+                                    now_ms,
+                                );
+                            }
                         }
                     },
                 }
@@ -585,7 +584,19 @@ pub fn process_outbound_frame(
                             );
                         }
                         Some(None) => unknown_destination = true,
-                        None => unknown_destination = !dest_ip.is_multicast(),
+                        None if dest_ip.is_multicast() => {
+                            let o = dest_ip.octets();
+                            send_multicast_frame(
+                                node,
+                                &mut actions,
+                                network_id,
+                                ([0x33, 0x33, o[12], o[13], o[14], o[15]], 0),
+                                ethertype,
+                                payload,
+                                now_ms,
+                            );
+                        }
+                        None => unknown_destination = true,
                     },
                 }
             }
@@ -657,6 +668,76 @@ fn send_unicast_frame(
             "sending EXT_FRAME"
         );
         push_fragmented_send(actions, pkt, path_address, ZT_DEFAULT_PHYSMTU);
+    }
+}
+
+/// Send `payload` as a MULTICAST_FRAME to the known members of a group
+/// (the network's multicast limit at most), as ZeroTier One's
+/// Multicaster::send does with the members it has gathered. Credentials go
+/// first where needed, as for unicast.
+#[allow(clippy::too_many_arguments)]
+fn send_multicast_frame(
+    node: &mut Node,
+    actions: &mut Vec<NodeAction>,
+    network_id: u64,
+    (group_mac, adi): ([u8; 6], u32),
+    ethertype: u16,
+    payload: &[u8],
+    now_ms: u64,
+) {
+    let our_zt_address = *node.identity.address.as_bytes();
+    let Some(limit) = node.find_network(network_id).map(|net| net.multicast_limit) else {
+        return;
+    };
+    let targets = node.multicast_manager.get_replication_targets(
+        network_id,
+        &group_mac,
+        adi,
+        &our_zt_address,
+        limit as usize,
+    );
+    if targets.is_empty() {
+        return;
+    }
+    // Our MAC is derived from our address, so receivers derive it too and
+    // no source MAC (flag 0x04) is sent.
+    let frame = MulticastFramePayload {
+        network_id,
+        flags: 0,
+        gather_limit: None,
+        source_mac: None,
+        dest_mac: group_mac,
+        adi,
+        ethertype,
+        payload,
+    };
+    let mut body = vec![0u8; 64 + payload.len()];
+    let body_len = frame.serialize(&mut body);
+    body.truncate(body_len);
+
+    for target in targets {
+        let Some((path_address, shared_secret)) =
+            node.topology.get_peer(&target).and_then(|peer| {
+                peer.best_path(now_ms)
+                    .and_then(|path| peer.shared_secret().map(|secret| (path.address, *secret)))
+            })
+        else {
+            continue;
+        };
+        if let Some(push) = node.credentials_if_needed(network_id, &target, now_ms) {
+            actions.push(push);
+        }
+        let packet_id = node.allocate_packet_id();
+        if let Some(packet) = build_encrypted_verb_packet(
+            packet_id,
+            &our_zt_address,
+            &target,
+            Verb::MulticastFrame,
+            &body,
+            &shared_secret,
+        ) {
+            push_fragmented_send(actions, packet, path_address, ZT_DEFAULT_PHYSMTU);
+        }
     }
 }
 
@@ -1602,5 +1683,63 @@ mod tests {
             ndp::icmpv6_checksum(&target, &peer_v6, &zeroed).to_be_bytes(),
             [na[2], na[3]]
         );
+    }
+
+    /// Outbound broadcast and multicast go out as MULTICAST_FRAME to the
+    /// members subscribed to the group upstream derives for the address,
+    /// and broadcast only when the network enables it.
+    #[test]
+    fn outbound_multicast_and_broadcast_reach_group_subscribers() {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let peer_id = test_identity(0x46);
+        let peer = *peer_id.address.as_bytes();
+        let path: SocketAddr = "10.0.0.40:9993".parse().unwrap();
+        let secret = [0x59; 48];
+        node.topology.add_peer(peer_id);
+        {
+            let p = node.topology.get_peer_mut(&peer).unwrap();
+            p.add_path(path, true, 1000);
+            p.state = PeerState::new_active(secret, 10, 1000, 1000);
+        }
+        let mdns_group = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
+        let v6_group = [0x33, 0x33, 0x00, 0x00, 0x00, 0xfb];
+        for mac in [mdns_group, [0xff; 6], v6_group] {
+            node.multicast_manager
+                .subscribe(network_id, mac, 0, peer, 1000);
+        }
+
+        let send = |node: &mut Node, ethertype: u16, packet: &[u8]| -> Vec<([u8; 6], u32)> {
+            process_outbound_frame(node, network_id, ethertype, packet, &our_address, 2000)
+                .iter()
+                .filter_map(|action| match action {
+                    NodeAction::SendTo { data, address } if *address == path => {
+                        decrypted_verb(data, &secret)
+                    }
+                    _ => None,
+                })
+                .filter(|(verb, _)| *verb == Verb::MulticastFrame)
+                .map(|(_, body)| {
+                    let frame = MulticastFramePayload::parse(&body).unwrap();
+                    (frame.dest_mac, frame.adi)
+                })
+                .collect()
+        };
+
+        let mut v4 = [0u8; 20];
+        v4[0] = 0x45;
+        v4[16..20].copy_from_slice(&[224, 0, 0, 251]);
+        assert_eq!(send(&mut node, 0x0800, &v4), vec![(mdns_group, 0)]);
+
+        v4[16..20].copy_from_slice(&[255, 255, 255, 255]);
+        assert_eq!(send(&mut node, 0x0800, &v4), vec![([0xff; 6], 0)]);
+        node.find_network_mut(network_id).unwrap().broadcast_enabled = false;
+        assert!(send(&mut node, 0x0800, &v4).is_empty());
+
+        let mut v6 = [0u8; 40];
+        v6[0] = 0x60;
+        v6[24..40].copy_from_slice(&"ff02::fb".parse::<core::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(send(&mut node, 0x86dd, &v6), vec![(v6_group, 0)]);
     }
 }
