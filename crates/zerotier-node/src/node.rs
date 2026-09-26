@@ -174,6 +174,55 @@ const ZT_MAX_NETWORK_CONFIG_SIZE: usize = 1_048_576;
 /// ZT_NETWORKCONFIG_FLAG_ENABLE_BROADCAST in a config's `f` value.
 const NETWORK_CONFIG_FLAG_ENABLE_BROADCAST: u64 = 0x02;
 
+/// Coarse IP scope, as ZeroTierOne's InetAddress::ipScope classifies them.
+#[derive(PartialEq, Eq)]
+enum IpScope {
+    Unusable,
+    LinkLocal,
+    Private,
+    Shared,
+    Global,
+}
+
+fn ip_scope(ip: IpAddr) -> IpScope {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_broadcast() {
+                IpScope::Unusable
+            } else if v4.is_link_local() {
+                IpScope::LinkLocal
+            } else if v4.is_private() {
+                IpScope::Private
+            } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                IpScope::Shared
+            } else {
+                IpScope::Global
+            }
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+                IpScope::Unusable
+            } else if first & 0xffc0 == 0xfe80 {
+                IpScope::LinkLocal
+            } else if first & 0xfe00 == 0xfc00 {
+                IpScope::Private
+            } else {
+                IpScope::Global
+            }
+        }
+    }
+}
+
+/// A reported surface is only believed when it is in the same scope as the
+/// reporter's address, so a LAN peer cannot make us advertise a LAN address
+/// as public or the reverse (SelfAwareness::iam).
+fn same_reportable_scope(surface: IpAddr, reporter: IpAddr) -> bool {
+    let scope = ip_scope(surface);
+    scope != IpScope::Unusable && scope == ip_scope(reporter)
+}
+
 /// Upper bound on local endpoints advertised or probed per peer.
 const MAX_LOCAL_ADDRESSES: usize = 8;
 
@@ -230,6 +279,9 @@ pub struct Node {
     /// Last RENDEZVOUS introduction per unordered peer pair.
     last_unite: BTreeMap<([u8; 5], [u8; 5]), u64>,
     expected_replies: ExpectedReplies,
+    /// Our external address as each peer we HELLO'd directly reported it
+    /// (ZeroTierOne SelfAwareness), keyed by that peer's address.
+    external_surfaces: BTreeMap<SocketAddr, (SocketAddr, u64)>,
 }
 
 impl Node {
@@ -267,6 +319,7 @@ impl Node {
             trusted_paths: BTreeMap::new(),
             last_unite: BTreeMap::new(),
             expected_replies: ExpectedReplies::default(),
+            external_surfaces: BTreeMap::new(),
         })
     }
 
@@ -696,8 +749,25 @@ impl Node {
     }
 
     /// PUSH_DIRECT_PATHS to active network peers.
+    /// Endpoints worth pushing to peers: our local interface addresses and
+    /// the external addresses peers saw us at, as ZeroTier One pushes
+    /// `directPaths()` plus `SelfAwareness::whoami()`.
+    fn advertised_endpoints(&self, now_ms: u64) -> Vec<SocketAddr> {
+        let mut endpoints = self.local_addresses.clone();
+        for (surface, seen) in self.external_surfaces.values() {
+            if now_ms.saturating_sub(*seen) < ZT_SELFAWARENESS_ENTRY_TIMEOUT
+                && !endpoints.contains(surface)
+            {
+                endpoints.push(*surface);
+            }
+        }
+        endpoints.truncate(MAX_LOCAL_ADDRESSES);
+        endpoints
+    }
+
     fn push_direct_paths(&mut self, now_ms: u64) {
-        if self.local_addresses.is_empty() {
+        let endpoints = self.advertised_endpoints(now_ms);
+        if endpoints.is_empty() {
             return;
         }
         let members: BTreeSet<[u8; 5]> = self
@@ -729,8 +799,7 @@ impl Node {
                 continue;
             };
             let payload = zerotier_protocol::verbs::push_direct::PushDirectPathsPayload {
-                paths: self
-                    .local_addresses
+                paths: endpoints
                     .iter()
                     .map(
                         |endpoint| zerotier_protocol::verbs::push_direct::DirectPath {
@@ -757,7 +826,7 @@ impl Node {
                     event = "push_direct_paths_sent",
                     peer = %format_args!("{:02x}{:02x}{:02x}{:02x}{:02x}",
                         addr[0], addr[1], addr[2], addr[3], addr[4]),
-                    num_paths = self.local_addresses.len(),
+                    num_paths = endpoints.len(),
                     "sent PUSH_DIRECT_PATHS"
                 );
                 self.actions.push(NodeAction::SendTo {
@@ -1445,9 +1514,23 @@ impl Node {
         };
 
         match ok.sub_payload {
-            OkSubPayload::Hello { timestamp_echo, .. } => {
+            OkSubPayload::Hello {
+                timestamp_echo,
+                external_address,
+                ..
+            } => {
                 // Compute latency from timestamp echo
                 let latency_ms = now_ms.saturating_sub(timestamp_echo) as u32;
+
+                // Where the responder saw our HELLO come from, recorded only
+                // for direct replies (ZeroTierOne _doOK -> SelfAwareness::iam).
+                if direct {
+                    if let Some(surface) = external_address.and_then(|a| a.to_socket_addr()) {
+                        if same_reportable_scope(surface.ip(), from.ip()) {
+                            self.external_surfaces.insert(from, (surface, now_ms));
+                        }
+                    }
+                }
 
                 // Find the peer by source address from packet header
                 let source = {
@@ -2750,6 +2833,8 @@ impl Node {
 
         self.trusted_paths
             .retain(|_, seen| now_ms.saturating_sub(*seen) < ZT_TRUST_EXPIRATION);
+        self.external_surfaces
+            .retain(|_, (_, seen)| now_ms.saturating_sub(*seen) < ZT_SELFAWARENESS_ENTRY_TIMEOUT);
         self.last_unite
             .retain(|_, last| now_ms.saturating_sub(*last) < ZT_MIN_UNITE_INTERVAL);
 
@@ -6421,5 +6506,76 @@ mod tests {
         assert!(node.topology.get_peer(&talker).is_none());
         assert!(node.topology.get_peer(&root).is_some());
         assert!(node.topology.get_peer(&controller_addr).is_some());
+    }
+
+    /// The address a peer saw our HELLO come from (OK(HELLO), direct only)
+    /// is advertised in PUSH_DIRECT_PATHS; a report in a different scope
+    /// than the reporter's own address is not believed.
+    #[test]
+    fn external_address_from_ok_hello_is_advertised() {
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let our_address = *node.identity.address.as_bytes();
+        let peer_id = test_identity(0x63);
+        let peer = *peer_id.address.as_bytes();
+        let peer_socket: SocketAddr = "198.51.100.10:9993".parse().unwrap();
+        let secret = [0x35; 48];
+        add_active_peer(&mut node, peer_id, peer_socket, secret);
+        node.join_network(make_membership_with_peer(
+            0xfe00000000abcdef,
+            our_address,
+            peer,
+        ));
+
+        let ok_hello = |node: &mut Node, external: &str| {
+            let request = node.allocate_request_id();
+            let mut buf = [0u8; 256];
+            let len = RootManager::build_ok_hello(
+                &test_identity(0x63),
+                &our_address,
+                request,
+                900,
+                &secret,
+                0x55,
+                false,
+                Some(external.parse().unwrap()),
+                &[],
+                &mut buf,
+            )
+            .unwrap();
+            let mut packet = buf[..len].to_vec();
+            node.receive_packet(&mut packet, peer_socket, 1_000);
+        };
+
+        ok_hello(&mut node, "10.9.8.7:9993");
+        assert!(node.advertised_endpoints(1_000).is_empty());
+
+        ok_hello(&mut node, "203.0.113.77:41000");
+        let public: SocketAddr = "203.0.113.77:41000".parse().unwrap();
+        assert_eq!(node.advertised_endpoints(1_000), vec![public]);
+        assert!(node
+            .advertised_endpoints(1_000 + ZT_SELFAWARENESS_ENTRY_TIMEOUT)
+            .is_empty());
+
+        let pushed = node.tick(2_000).iter().any(|action| match action {
+            NodeAction::SendTo { data, address } if *address == peer_socket => {
+                let mut packet = data.clone();
+                salsa::dearmor_packet(&secret, &mut packet).is_ok()
+                    && Verb::from_byte(packet[27] & 0x1f) == Some(Verb::PushDirectPaths)
+                    && zerotier_protocol::verbs::push_direct::PushDirectPathsPayload::deserialize(
+                        &packet[28..],
+                    )
+                    .is_ok_and(|push| {
+                        push.paths
+                            .iter()
+                            .any(|path| path.address.to_socket_addr() == Some(public))
+                    })
+            }
+            _ => false,
+        });
+        assert!(
+            pushed,
+            "the external address must be pushed to network peers"
+        );
     }
 }
