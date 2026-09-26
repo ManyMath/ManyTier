@@ -19,7 +19,9 @@ use zerotier_protocol::fragment::ReassemblyBuffer;
 use zerotier_protocol::inet_address::InetAddress;
 use zerotier_protocol::verb::Verb;
 use zerotier_protocol::verbs::ack::AckPayload;
-use zerotier_protocol::verbs::hello::{HelloPayload, MANYTIER_ADVERTISED_PROTOCOL_VERSION};
+use zerotier_protocol::verbs::hello::{
+    HelloPayload, HelloWorld, MANYTIER_ADVERTISED_PROTOCOL_VERSION,
+};
 use zerotier_protocol::verbs::network_config::{
     CertificateOfMembership, NetworkConfigPayload, NetworkCredentialsPayload,
 };
@@ -290,6 +292,19 @@ impl Node {
         let packet_id = self.allocate_packet_id();
         self.expected_replies.insert(packet_id);
         packet_id
+    }
+
+    /// The worlds we orbit, as listed at the end of our HELLOs.
+    fn hello_worlds(&self) -> Vec<HelloWorld> {
+        self.topology
+            .moons
+            .iter()
+            .map(|moon| HelloWorld {
+                world_type: moon.world_type.to_byte(),
+                id: moon.id,
+                timestamp: moon.timestamp,
+            })
+            .collect()
     }
 
     /// Did we send a request with this packet ID (recently enough)?
@@ -661,6 +676,7 @@ impl Node {
             &mut buf,
             planet_id,
             planet_ts,
+            &self.hello_worlds(),
         ) {
             tracing::info!(
                 target: "manytier",
@@ -1386,6 +1402,8 @@ impl Node {
                 &shared_secret,
                 reply_id,
                 false,
+                Some(from),
+                &[],
                 &mut buf,
             ) {
                 self.actions.push(NodeAction::SendTo {
@@ -1526,6 +1544,7 @@ impl Node {
                                     &mut hello_buf,
                                     planet_id,
                                     planet_ts,
+                                    &self.hello_worlds(),
                                 ) {
                                     self.actions.push(NodeAction::SendTo {
                                         data: hello_buf[..len].to_vec(),
@@ -2293,6 +2312,7 @@ impl Node {
                     &mut buf,
                     planet_id,
                     planet_ts,
+                    &self.hello_worlds(),
                 ) {
                     tracing::info!(
                         target: "manytier",
@@ -2845,6 +2865,7 @@ impl Node {
                 &mut buf,
                 planet_id,
                 planet_ts,
+                &self.hello_worlds(),
             ) {
                 tracing::info!(
                     target: "manytier",
@@ -2903,6 +2924,7 @@ impl Node {
                 &mut buf,
                 planet_id,
                 planet_ts,
+                &self.hello_worlds(),
             ) {
                 self.actions.push(NodeAction::SendTo {
                     data: buf[..len].to_vec(),
@@ -2952,6 +2974,7 @@ impl Node {
                 &mut buf,
                 planet_id,
                 planet_ts,
+                &self.hello_worlds(),
             ) {
                 self.actions.push(NodeAction::SendTo {
                     data: buf[..len].to_vec(),
@@ -3013,6 +3036,7 @@ impl Node {
                 &mut buf,
                 planet_id,
                 planet_ts,
+                &self.hello_worlds(),
             ) {
                 tracing::info!(
                     target: "manytier",
@@ -3220,6 +3244,7 @@ impl Node {
                 &mut buf,
                 planet_id,
                 planet_ts,
+                &self.hello_worlds(),
             ) {
                 self.actions.push(NodeAction::SendTo {
                     data: buf[..len].to_vec(),
@@ -5236,6 +5261,7 @@ mod tests {
             &mut buf,
             zerotier_protocol::constants::WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
 
@@ -5303,6 +5329,7 @@ mod tests {
             &mut buf,
             zerotier_protocol::constants::WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
         let mut forged_hello = buf[..len].to_vec();

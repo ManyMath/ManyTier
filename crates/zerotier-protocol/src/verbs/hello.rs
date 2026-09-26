@@ -23,7 +23,47 @@ pub struct HelloPayload {
     pub dest_address: InetAddress,
     pub planet_world_id: u64,
     pub planet_world_timestamp: u64,
-    pub moon_records: Vec<(u64, u64)>,
+}
+
+/// One entry of the world list a HELLO ends with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloWorld {
+    pub world_type: u8,
+    pub id: u64,
+    pub timestamp: u64,
+}
+
+/// Serialize the world list that follows the planet timestamp in a HELLO:
+/// a u16 count, then per world [1] type [8] id [8] timestamp (ZeroTierOne
+/// node/Peer.cpp `sendHELLO`). On the wire this section is encrypted with
+/// `Packet::cryptField`; this works on the plaintext. Returns bytes written.
+pub fn serialize_hello_worlds(worlds: &[HelloWorld], buf: &mut [u8]) -> usize {
+    buf[0..2].copy_from_slice(&(worlds.len() as u16).to_be_bytes());
+    let mut pos = 2;
+    for world in worlds {
+        buf[pos] = world.world_type;
+        buf[pos + 1..pos + 9].copy_from_slice(&world.id.to_be_bytes());
+        buf[pos + 9..pos + 17].copy_from_slice(&world.timestamp.to_be_bytes());
+        pos += 17;
+    }
+    pos
+}
+
+/// Parse a decrypted HELLO world list, stopping at the first truncated
+/// entry as upstream's bounds-checked reads would.
+pub fn deserialize_hello_worlds(data: &[u8]) -> Vec<HelloWorld> {
+    let Some(count) = data.get(..2).map(|c| u16::from_be_bytes([c[0], c[1]])) else {
+        return Vec::new();
+    };
+    data[2..]
+        .chunks_exact(17)
+        .take(count as usize)
+        .map(|entry| HelloWorld {
+            world_type: entry[0],
+            id: u64::from_be_bytes(entry[1..9].try_into().unwrap_or([0; 8])),
+            timestamp: u64::from_be_bytes(entry[9..17].try_into().unwrap_or([0; 8])),
+        })
+        .collect()
 }
 
 impl HelloPayload {
@@ -43,7 +83,6 @@ impl HelloPayload {
             dest_address,
             planet_world_id: crate::constants::WORLD_ID_EARTH,
             planet_world_timestamp: 0,
-            moon_records: Vec::new(),
         }
     }
 
@@ -85,19 +124,12 @@ impl HelloPayload {
         buf[pos..pos + 8].copy_from_slice(&self.planet_world_timestamp.to_be_bytes());
         pos += 8;
 
-        // Moon records
-        for &(world_id, ts) in &self.moon_records {
-            buf[pos..pos + 8].copy_from_slice(&world_id.to_be_bytes());
-            pos += 8;
-            buf[pos..pos + 8].copy_from_slice(&ts.to_be_bytes());
-            pos += 8;
-        }
-
         Ok(pos)
     }
 
     /// Deserialize a HELLO payload from a byte slice (after the verb byte).
-    /// Returns the payload and the number of bytes consumed.
+    /// Returns the payload and the number of bytes consumed, which is where
+    /// the encrypted world list (see [`deserialize_hello_worlds`]) starts.
     pub fn deserialize(data: &[u8]) -> Result<(Self, usize), ProtocolError> {
         if data.len() < 13 {
             return Err(ProtocolError::TooShort {
@@ -166,34 +198,6 @@ impl HelloPayload {
         ]);
         pos += 8;
 
-        // Moon records (remaining data, 16 bytes each)
-        let mut moon_records = Vec::new();
-        while pos + 16 <= data.len() {
-            let world_id = u64::from_be_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
-            let ts = u64::from_be_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
-            moon_records.push((world_id, ts));
-        }
-
         Ok((
             Self {
                 protocol_version,
@@ -205,7 +209,6 @@ impl HelloPayload {
                 dest_address,
                 planet_world_id,
                 planet_world_timestamp,
-                moon_records,
             },
             pos,
         ))
@@ -254,7 +257,6 @@ mod tests {
             parsed.planet_world_timestamp,
             payload.planet_world_timestamp
         );
-        assert_eq!(parsed.moon_records.len(), 0);
     }
 
     #[test]
@@ -284,18 +286,19 @@ mod tests {
         assert_eq!(&buf[13..18], &[0xa0, 0xb1, 0xc2, 0xd3, 0xe4]); // address
     }
 
+    /// The cleartext part ends at the planet timestamp; the world list
+    /// after it is encrypted on the wire and not part of this codec.
     #[test]
-    fn hello_zero_moons() {
+    fn hello_deserialize_stops_before_the_world_list() {
         let id = build_test_identity();
         let payload = HelloPayload::new(id, 1000, InetAddress::Null);
-        assert!(payload.moon_records.is_empty());
 
         let mut buf = [0u8; 512];
         let n = payload.serialize(&mut buf).unwrap();
+        let m = serialize_hello_worlds(&[], &mut buf[n..]);
 
-        let (parsed, consumed) = HelloPayload::deserialize(&buf[..n]).unwrap();
+        let (_, consumed) = HelloPayload::deserialize(&buf[..n + m]).unwrap();
         assert_eq!(consumed, n);
-        assert!(parsed.moon_records.is_empty());
     }
 
     #[test]
@@ -329,22 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn hello_with_moons() {
-        let id = build_test_identity();
-        let mut payload = HelloPayload::new(id, 5000, InetAddress::Null);
-        payload.moon_records = alloc::vec![(100, 200), (300, 400)];
-
-        let mut buf = [0u8; 512];
-        let n = payload.serialize(&mut buf).unwrap();
-
-        let (parsed, consumed) = HelloPayload::deserialize(&buf[..n]).unwrap();
-        assert_eq!(consumed, n);
-        assert_eq!(parsed.moon_records.len(), 2);
-        assert_eq!(parsed.moon_records[0], (100, 200));
-        assert_eq!(parsed.moon_records[1], (300, 400));
-    }
-
-    #[test]
     fn hello_with_v4_dest() {
         let id = build_test_identity();
         let addr = InetAddress::V4 {
@@ -364,5 +351,27 @@ mod tests {
     fn hello_deserialize_too_short() {
         let data = [0u8; 10];
         assert!(HelloPayload::deserialize(&data).is_err());
+    }
+
+    /// Layout from ZeroTierOne node/Peer.cpp sendHELLO: u16 count, then
+    /// [1] type [8] id [8] timestamp per world.
+    #[test]
+    fn hello_worlds_match_upstream_layout() {
+        let worlds = [HelloWorld {
+            world_type: crate::constants::WORLD_TYPE_MOON,
+            id: 0x0000_0021_05b7_8c5f,
+            timestamp: 0x0102_0304_0506_0708,
+        }];
+        let mut buf = [0u8; 64];
+        let n = serialize_hello_worlds(&worlds, &mut buf);
+        assert_eq!(
+            &buf[..n],
+            &[
+                0x00, 0x01, 0x7f, 0x00, 0x00, 0x00, 0x21, 0x05, 0xb7, 0x8c, 0x5f, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07, 0x08,
+            ]
+        );
+        assert_eq!(deserialize_hello_worlds(&buf[..n]), worlds);
+        assert!(deserialize_hello_worlds(&buf[..n - 1]).is_empty());
     }
 }

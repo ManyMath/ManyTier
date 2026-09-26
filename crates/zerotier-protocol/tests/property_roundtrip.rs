@@ -133,7 +133,6 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
             dest_address: inet_address.clone(),
             planet_world_id: seed ^ 0x1234,
             planet_world_timestamp: seed ^ 0x4321,
-            moon_records: vec![(seed, seed + 1), (seed + 2, seed + 3)],
         };
         let mut hello_buf = vec![0u8; 1024];
         let hello_len = hello.serialize(&mut hello_buf).unwrap();
@@ -142,7 +141,6 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
         assert_eq!(hello_parsed.identity.address, hello.identity.address);
         assert_eq!(hello_parsed.identity.public_key, hello.identity.public_key);
         assert_eq!(hello_parsed.dest_address, hello.dest_address);
-        assert_eq!(hello_parsed.moon_records, hello.moon_records);
 
         let frame = FramePayload {
             network_id: seed,

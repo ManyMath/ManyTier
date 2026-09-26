@@ -2,6 +2,7 @@
 
 use crate::error::ProtocolError;
 use crate::identity_wire;
+use crate::inet_address::InetAddress;
 use crate::verb::Verb;
 use alloc::vec::Vec;
 use zerotier_crypto::identity::Identity;
@@ -22,7 +23,11 @@ pub enum OkSubPayload {
         major_version: u8,
         minor_version: u8,
         revision: u16,
-        world_update: Option<Vec<u8>>,
+        /// The address the HELLO arrived from, i.e. our external surface as
+        /// the responder sees it.
+        external_address: Option<InetAddress>,
+        /// Serialized planet/moon updates for the HELLO's sender.
+        worlds: Vec<u8>,
     },
     /// OK response to WHOIS.
     Whois { identities: Vec<Identity> },
@@ -48,7 +53,8 @@ impl OkPayload {
                 major_version,
                 minor_version,
                 revision,
-                world_update,
+                external_address,
+                worlds,
             } => {
                 buf[pos..pos + 8].copy_from_slice(&timestamp_echo.to_be_bytes());
                 pos += 8;
@@ -60,10 +66,16 @@ impl OkPayload {
                 pos += 1;
                 buf[pos..pos + 2].copy_from_slice(&revision.to_be_bytes());
                 pos += 2;
-                if let Some(world) = world_update {
-                    buf[pos..pos + world.len()].copy_from_slice(world);
-                    pos += world.len();
-                }
+                // ZeroTierOne node/IncomingPacket.cpp _doHELLO: the sender's
+                // address, then a u16-length-prefixed run of worlds.
+                pos += external_address
+                    .as_ref()
+                    .unwrap_or(&InetAddress::Null)
+                    .serialize(&mut buf[pos..]);
+                buf[pos..pos + 2].copy_from_slice(&(worlds.len() as u16).to_be_bytes());
+                pos += 2;
+                buf[pos..pos + worlds.len()].copy_from_slice(worlds);
+                pos += worlds.len();
             }
             OkSubPayload::Whois { identities } => {
                 for id in identities {
@@ -118,10 +130,23 @@ impl OkPayload {
                 let major_version = sub_data[9];
                 let minor_version = sub_data[10];
                 let revision = u16::from_be_bytes([sub_data[11], sub_data[12]]);
-                let world_update = if sub_data.len() > 13 {
-                    Some(sub_data[13..].to_vec())
-                } else {
-                    None
+                let mut rest = &sub_data[13..];
+                let external_address = match InetAddress::deserialize(rest) {
+                    Ok((address, used)) => {
+                        rest = &rest[used..];
+                        Some(address).filter(|address| *address != InetAddress::Null)
+                    }
+                    Err(_) => {
+                        rest = &[];
+                        None
+                    }
+                };
+                let worlds = match rest {
+                    [hi, lo, worlds @ ..] => {
+                        let len = (u16::from_be_bytes([*hi, *lo]) as usize).min(worlds.len());
+                        worlds[..len].to_vec()
+                    }
+                    _ => Vec::new(),
                 };
                 OkSubPayload::Hello {
                     timestamp_echo,
@@ -129,7 +154,8 @@ impl OkPayload {
                     major_version,
                     minor_version,
                     revision,
-                    world_update,
+                    external_address,
+                    worlds,
                 }
             }
             Verb::Whois => {
@@ -185,7 +211,8 @@ mod tests {
                 major_version: 0,
                 minor_version: 1,
                 revision: 0,
-                world_update: None,
+                external_address: None,
+                worlds: Vec::new(),
             },
         };
 
@@ -202,7 +229,8 @@ mod tests {
             major_version,
             minor_version,
             revision,
-            world_update,
+            external_address,
+            worlds,
         } = parsed.sub_payload
         {
             assert_eq!(timestamp_echo, 1234567890123);
@@ -210,15 +238,20 @@ mod tests {
             assert_eq!(major_version, 0);
             assert_eq!(minor_version, 1);
             assert_eq!(revision, 0);
-            assert!(world_update.is_none());
+            assert!(external_address.is_none());
+            assert!(worlds.is_empty());
         } else {
             panic!("expected OkSubPayload::Hello");
         }
     }
 
     #[test]
-    fn ok_hello_with_world_update() {
+    fn ok_hello_with_external_address_and_worlds() {
         let world_data = alloc::vec![0x01, 0x02, 0x03, 0x04];
+        let external = InetAddress::V4 {
+            ip: [203, 0, 113, 9],
+            port: 41234,
+        };
         let ok = OkPayload {
             in_re_verb: Verb::Hello,
             in_re_packet_id: 1,
@@ -228,7 +261,8 @@ mod tests {
                 major_version: 1,
                 minor_version: 2,
                 revision: 3,
-                world_update: Some(world_data.clone()),
+                external_address: Some(external.clone()),
+                worlds: world_data.clone(),
             },
         };
 
@@ -236,11 +270,38 @@ mod tests {
         let n = ok.serialize(&mut buf).unwrap();
 
         let parsed = OkPayload::deserialize(&buf[..n]).unwrap();
-        if let OkSubPayload::Hello { world_update, .. } = parsed.sub_payload {
-            assert_eq!(world_update, Some(world_data));
+        if let OkSubPayload::Hello {
+            external_address,
+            worlds,
+            ..
+        } = parsed.sub_payload
+        {
+            assert_eq!(external_address, Some(external));
+            assert_eq!(worlds, world_data);
         } else {
             panic!("expected OkSubPayload::Hello");
         }
+    }
+
+    /// Older peers stop after the revision; both trailing fields are then
+    /// absent.
+    #[test]
+    fn ok_hello_without_trailing_fields() {
+        let mut data = alloc::vec![Verb::Hello.to_byte()];
+        data.extend_from_slice(&7u64.to_be_bytes());
+        data.extend_from_slice(&5000u64.to_be_bytes());
+        data.extend_from_slice(&[13, 1, 2, 0, 3]);
+        let parsed = OkPayload::deserialize(&data).unwrap();
+        let OkSubPayload::Hello {
+            external_address,
+            worlds,
+            ..
+        } = parsed.sub_payload
+        else {
+            panic!("expected OkSubPayload::Hello");
+        };
+        assert!(external_address.is_none());
+        assert!(worlds.is_empty());
     }
 
     #[test]
@@ -254,15 +315,18 @@ mod tests {
                 major_version: 0,
                 minor_version: 1,
                 revision: 0,
-                world_update: None,
+                external_address: None,
+                worlds: Vec::new(),
             },
         };
 
         let mut buf = [0u8; 256];
         let n = ok.serialize(&mut buf).unwrap();
 
-        // Header: verb (1) + packet_id (8) + sub-payload (13) = 22
-        assert_eq!(n, 22);
+        // Header: verb (1) + packet_id (8) + sub-payload (13), then a null
+        // external address (1) and an empty world run (2) = 25
+        assert_eq!(n, 25);
+        assert_eq!(&buf[22..25], &[0, 0, 0]);
         assert_eq!(buf[0], Verb::Hello.to_byte()); // in_re_verb
         assert_eq!(
             &buf[1..9],

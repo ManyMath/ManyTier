@@ -10,7 +10,9 @@ use zerotier_crypto::salsa;
 use zerotier_protocol::constants::*;
 use zerotier_protocol::inet_address::InetAddress;
 use zerotier_protocol::verb::Verb;
-use zerotier_protocol::verbs::hello::{HelloPayload, MANYTIER_ADVERTISED_PROTOCOL_VERSION};
+use zerotier_protocol::verbs::hello::{
+    serialize_hello_worlds, HelloPayload, HelloWorld, MANYTIER_ADVERTISED_PROTOCOL_VERSION,
+};
 use zerotier_protocol::verbs::ok::OkPayload;
 use zerotier_protocol::verbs::rendezvous::RendezvousPayload;
 use zerotier_protocol::verbs::whois::WhoisRequest;
@@ -63,6 +65,7 @@ impl RootManager {
         buf: &mut [u8],
         planet_world_id: u64,
         planet_world_timestamp: u64,
+        worlds: &[HelloWorld],
     ) -> Result<(usize, u64), ProtocolError> {
         if buf.len() < ZT_PROTO_MIN_PACKET_LENGTH + 128 {
             return Err(ProtocolError::TooShort {
@@ -107,25 +110,26 @@ impl RootManager {
         hello.planet_world_timestamp = planet_world_timestamp;
 
         let payload_len = hello.serialize(&mut buf[28..])?;
-        let moon_count_offset = 28 + payload_len;
-        buf[moon_count_offset..moon_count_offset + 2].copy_from_slice(&0u16.to_be_bytes());
-        let moon_end = moon_count_offset + 2;
-
-        // Empty COR (Certificate of Representation): 2 bytes, count = 0 (big-endian u16).
-        // Plaintext: NOT encrypted via crypt_packet_field. COR is included in the Poly1305
-        // MAC scope because armor_packet MACs everything from verb (byte 27) to end of packet.
-        // This closes 2 bytes of the 17-byte gap against official zerotier-one 1.14.2 HELLOs.
-        // COR must be appended BEFORE crypt_packet_field so that the mangled-key size field
-        // matches what the receiver sees (the full packet length including COR).
-        let cor_offset = moon_end;
-        buf[cor_offset] = 0x00;
-        buf[cor_offset + 1] = 0x00;
-        let total_len = cor_offset + 2;
-
-        // Encrypt the moon-count field (matches official Packet::cryptField on moon section).
-        // Called over the full packet so mangled-key size matches receiver's view.
-        salsa::crypt_packet_field(shared_secret, &mut buf[..total_len], moon_count_offset, 2)
-            .map_err(ProtocolError::CryptoError)?;
+        // The world list we orbit follows, encrypted with cryptField as in
+        // ZeroTierOne node/Peer.cpp sendHELLO, so a root can tell us about
+        // newer versions of them.
+        let worlds_offset = 28 + payload_len;
+        let worlds_len = 2 + 17 * worlds.len();
+        if buf.len() < worlds_offset + worlds_len {
+            return Err(ProtocolError::TooShort {
+                need: worlds_offset + worlds_len,
+                got: buf.len(),
+            });
+        }
+        serialize_hello_worlds(worlds, &mut buf[worlds_offset..]);
+        let total_len = worlds_offset + worlds_len;
+        salsa::crypt_packet_field(
+            shared_secret,
+            &mut buf[..total_len],
+            worlds_offset,
+            worlds_len,
+        )
+        .map_err(ProtocolError::CryptoError)?;
 
         // Armor: cipher suite 0 = MAC only, no encryption.
         // Always use the mangled-key path: the official controller verifies the
@@ -195,11 +199,14 @@ impl RootManager {
         shared_secret: &[u8; 48],
         packet_id: u64,
         use_unmangled_null: bool,
+        external_address: Option<core::net::SocketAddr>,
+        worlds: &[u8],
         buf: &mut [u8],
     ) -> Result<usize, ProtocolError> {
-        if buf.len() < ZT_PROTO_MIN_PACKET_LENGTH + 32 {
+        let need = ZT_PROTO_MIN_PACKET_LENGTH + 64 + worlds.len();
+        if buf.len() < need {
             return Err(ProtocolError::TooShort {
-                need: ZT_PROTO_MIN_PACKET_LENGTH + 32,
+                need,
                 got: buf.len(),
             });
         }
@@ -226,7 +233,8 @@ impl RootManager {
                 major_version: 0,
                 minor_version: 1,
                 revision: 0,
-                world_update: None,
+                external_address: external_address.map(InetAddress::from_socket_addr),
+                worlds: worlds.to_vec(),
             },
         };
 
@@ -331,13 +339,14 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
 
         assert!(len >= ZT_PROTO_MIN_PACKET_LENGTH);
         assert_eq!(
-            len, 139,
-            "HELLO length must include 2-byte empty COR trailer"
+            len, 137,
+            "HELLO ends with the encrypted world list (an empty one here)"
         );
 
         // Parse header -- verb is encrypted (cipher suite 0 = MAC only, verb is NOT encrypted)
@@ -373,6 +382,8 @@ mod tests {
             &secret,
             2000,
             false,
+            None,
+            &[],
             &mut buf,
         )
         .unwrap();
@@ -392,8 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn cor_field_present_in_hello() {
-        // Empty COR (Certificate of Representation) count = 0 per official HELLO layout;
+    fn hello_ends_with_our_encrypted_world_list() {
+        // The HELLO ends with the worlds we orbit, encrypted with cryptField
+        // (ZeroTierOne node/Peer.cpp sendHELLO), and nothing after them;
         // closes 2 bytes of the 17-byte gap to official zerotier-one 1.14.2.
         use zerotier_crypto::identity::Identity;
 
@@ -434,6 +446,11 @@ mod tests {
         let server_pub = x25519_dalek::PublicKey::from(server.public_key.dh);
         let shared = zerotier_crypto::key_agreement::key_agree(&client_secret.dh, &server_pub);
 
+        let moon = HelloWorld {
+            world_type: WORLD_TYPE_MOON,
+            id: 0x0000_0021_05b7_8c5f,
+            timestamp: 1_700_000_000_000,
+        };
         let mut buf = [0u8; 512];
         let (len, _) = RootManager::build_hello(
             &client,
@@ -445,16 +462,13 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[moon],
         )
         .unwrap();
 
-        // New HELLO total = previous 137 + 2-byte COR trailer = 139.
-        assert_eq!(
-            len, 139,
-            "HELLO length must include 2-byte empty COR trailer"
-        );
+        assert_eq!(len, 137 + 17, "one 17-byte world entry");
 
-        // Receiver-side: dearmor verifies that the MAC scope covers the COR bytes.
+        // Receiver-side: dearmor verifies that the MAC covers the world list.
         let server_secret = server.secret.as_ref().unwrap();
         let client_pub = x25519_dalek::PublicKey::from(client.public_key.dh);
         let shared2 = zerotier_crypto::key_agreement::key_agree(&server_secret.dh, &client_pub);
@@ -463,7 +477,7 @@ mod tests {
         let result = salsa::dearmor_packet(&shared2, &mut buf[..len]);
         assert!(
             result.is_ok(),
-            "MAC must verify across COR bytes: {:?}",
+            "MAC must verify across the world list: {:?}",
             result.err()
         );
 
@@ -472,17 +486,11 @@ mod tests {
         let moon_offset = 28 + 1 + 1 + 1 + 2 + 8 + 71 + 7 + 8 + 8;
         assert_eq!(moon_offset, 135);
 
-        // Decrypt the moon-count field; it should be 0.
-        salsa::crypt_packet_field(&shared2, &mut buf[..len], moon_offset, 2).unwrap();
-        let moon_count = u16::from_be_bytes([buf[moon_offset], buf[moon_offset + 1]]);
-        assert_eq!(moon_count, 0, "Moon count should be 0");
-
-        // COR bytes are PLAINTEXT: never encrypted via crypt_packet_field.
-        // They live immediately after the moon section at offsets 137..139.
+        let world_len = len - moon_offset;
+        salsa::crypt_packet_field(&shared2, &mut buf[..len], moon_offset, world_len).unwrap();
         assert_eq!(
-            &buf[moon_offset + 2..moon_offset + 4],
-            &[0x00, 0x00],
-            "COR must be empty (count = 0, plaintext)"
+            zerotier_protocol::verbs::hello::deserialize_hello_worlds(&buf[moon_offset..len]),
+            [moon]
         );
     }
 
@@ -503,9 +511,8 @@ mod tests {
         //   offset 112: dest InetAddress (7 bytes for IPv4)
         //   offset 119: planet_world_id (8 bytes BE)   <-- this test asserts this field
         //   offset 127: planet_world_timestamp (8 bytes BE)
-        //   offset 135: moon_count (2 bytes, cryptField-encrypted)
-        //   offset 137: COR trailer (2 bytes 0x00 0x00, plaintext)
-        //   offset 139: end
+        //   offset 135: world count (2 bytes, cryptField-encrypted)
+        //   offset 137: end (no worlds)
 
         use zerotier_crypto::identity::Identity;
 
@@ -564,10 +571,11 @@ mod tests {
             &mut buf,
             custom_planet_id,
             custom_planet_ts,
+            &[],
         )
         .unwrap();
 
-        assert_eq!(len, 139, "HELLO length must be 139 bytes");
+        assert_eq!(len, 137, "HELLO length must be 137 bytes");
 
         // Dearmor to confirm the MAC covers the planet fields correctly.
         let server_secret = server.secret.as_ref().unwrap();
@@ -689,6 +697,7 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
 
@@ -719,6 +728,7 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[],
         )
         .is_err());
     }
@@ -758,6 +768,7 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
 
@@ -819,6 +830,7 @@ mod tests {
             &mut buf,
             WORLD_ID_EARTH,
             0,
+            &[],
         )
         .unwrap();
 
