@@ -137,6 +137,9 @@ pub const ZT_PATH_HELLO_RATE_LIMIT: u64 = 1_000;
 /// Minimum interval between UNITE (rendezvous) messages for a peer pair.
 pub const ZT_MIN_UNITE_INTERVAL: u64 = 30_000;
 
+/// Most physical paths kept per peer (ZeroTierOne `ZT_MAX_PEER_NETWORK_PATHS`).
+pub const ZT_MAX_PEER_NETWORK_PATHS: usize = 64;
+
 /// How long a physical path stays trusted for relaying after the last
 /// authenticated packet on it (ZeroTierOne `ZT_TRUST_EXPIRATION`).
 pub const ZT_TRUST_EXPIRATION: u64 = 600_000;

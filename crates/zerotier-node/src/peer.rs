@@ -10,9 +10,9 @@ use core::net::SocketAddr;
 use zeroize::ZeroizeOnDrop;
 use zerotier_crypto::identity::Identity;
 use zerotier_protocol::{
-    ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT, ZT_PEER_CREDENTIALS_RATE_LIMIT,
-    ZT_PEER_GENERAL_RATE_LIMIT, ZT_PEER_PING_PERIOD, ZT_PEER_WHOIS_RATE_LIMIT,
-    ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
+    ZT_MAX_PEER_NETWORK_PATHS, ZT_PATH_HELLO_RATE_LIMIT, ZT_PEER_ACTIVITY_TIMEOUT,
+    ZT_PEER_CREDENTIALS_RATE_LIMIT, ZT_PEER_GENERAL_RATE_LIMIT, ZT_PEER_PING_PERIOD,
+    ZT_PEER_WHOIS_RATE_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT, ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME,
 };
 
 use crate::path::Path;
@@ -137,6 +137,8 @@ pub struct Peer {
     last_direct_path_push_receive: u64,
     /// Pushes received inside the current cutoff window.
     direct_path_push_cutoff_count: u8,
+    /// When the node first saw this peer in its periodic tasks; 0 until then.
+    first_seen: u64,
     /// Last ERROR(NEED_MEMBERSHIP_CERTIFICATE) we sent this peer.
     last_credentials_request: u64,
     last_credentials_received: u64,
@@ -154,6 +156,7 @@ impl Peer {
             last_direct_path_push: 0,
             last_direct_path_push_receive: 0,
             direct_path_push_cutoff_count: 0,
+            first_seen: 0,
             last_credentials_request: 0,
             last_credentials_received: 0,
             last_whois_request_received: 0,
@@ -229,6 +232,24 @@ impl Peer {
         self.state = PeerState::new_active(shared_secret, latency_ms, now_ms, now_ms);
     }
 
+    /// When we last heard from this peer, counting from the first periodic
+    /// check if we never have (a WHOIS-learned peer that never answered).
+    pub fn last_heard(&mut self, now_ms: u64) -> u64 {
+        if self.first_seen == 0 {
+            self.first_seen = now_ms;
+        }
+        let session = match self.state {
+            PeerState::Active { last_receive, .. } => last_receive,
+            _ => 0,
+        };
+        self.paths
+            .iter()
+            .map(|path| path.last_receive)
+            .chain([session, self.first_seen])
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Get the best path for sending (prefer direct, lowest latency).
     /// Uses quality_score which combines latency, relay penalty, and age.
     pub fn best_path(&self, now_ms: u64) -> Option<&Path> {
@@ -248,6 +269,19 @@ impl Peer {
             existing.received(now_ms);
             existing.is_direct |= is_direct;
         } else {
+            // Keep at most ZT_MAX_PEER_NETWORK_PATHS, replacing the one heard
+            // from least recently (NAT port churn adds a path per mapping).
+            if self.paths.len() >= ZT_MAX_PEER_NETWORK_PATHS {
+                if let Some(oldest) = self
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, path)| path.last_receive)
+                    .map(|(index, _)| index)
+                {
+                    self.paths.swap_remove(oldest);
+                }
+            }
             let mut path = Path::new(addr, now_ms);
             path.is_direct = is_direct;
             self.paths.push(path);
@@ -580,5 +614,20 @@ mod tests {
         assert!(!peer.rate_gate_push_direct_paths(1100));
         // A quiet period resets the window.
         assert!(peer.rate_gate_push_direct_paths(1100 + ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME + 1));
+    }
+
+    #[test]
+    fn paths_are_capped_by_replacing_the_least_recently_heard() {
+        let mut peer = stub_peer();
+        for i in 0..ZT_MAX_PEER_NETWORK_PATHS as u16 {
+            let addr: SocketAddr = alloc::format!("192.0.2.1:{}", 10_000 + i).parse().unwrap();
+            peer.add_path(addr, true, 1_000 + u64::from(i));
+        }
+        let newest: SocketAddr = "192.0.2.1:9993".parse().unwrap();
+        peer.add_path(newest, true, 5_000);
+        assert_eq!(peer.paths.len(), ZT_MAX_PEER_NETWORK_PATHS);
+        assert!(peer.paths.iter().any(|path| path.address == newest));
+        let oldest: SocketAddr = "192.0.2.1:10000".parse().unwrap();
+        assert!(!peer.paths.iter().any(|path| path.address == oldest));
     }
 }

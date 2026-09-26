@@ -2742,6 +2742,25 @@ impl Node {
             now_ms.saturating_sub(pending.requested_at_ms) <= MULTICAST_SUBSCRIPTION_MAX_AGE_MS
         });
 
+        // Forget peers silent for ZT_PEER_ACTIVITY_TIMEOUT, as ZeroTierOne's
+        // Topology::doPeriodicTasks does. Roots stay, and so do the
+        // controllers of networks we are in: their keys verify every COM.
+        let keep: BTreeSet<[u8; 5]> = self
+            .topology
+            .roots
+            .iter()
+            .copied()
+            .chain(
+                self.networks
+                    .iter()
+                    .map(|net| controller_address_from_network_id(net.network_id)),
+            )
+            .collect();
+        self.topology.peers.retain(|addr, peer| {
+            keep.contains(addr)
+                || now_ms.saturating_sub(peer.last_heard(now_ms)) < ZT_PEER_ACTIVITY_TIMEOUT
+        });
+
         // 2. Check for stale peers (no activity for 500s) and mark them
         let stale_addrs: Vec<[u8; 5]> = self
             .topology
@@ -6326,5 +6345,54 @@ mod tests {
             _ => false,
         });
         assert!(liked, "MULTICAST_LIKE with our three groups expected");
+    }
+
+    /// Peers silent for ZT_PEER_ACTIVITY_TIMEOUT are forgotten, including a
+    /// WHOIS-learned peer that never answered; roots and the controllers of
+    /// joined networks are kept.
+    #[test]
+    fn silent_peers_are_forgotten_but_roots_and_controllers_stay() {
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let root = node.topology.roots[0];
+
+        let controller = test_identity(0x60);
+        let controller_addr = *controller.address.as_bytes();
+        let network_id = u64::from_be_bytes([
+            0,
+            0,
+            0,
+            controller_addr[0],
+            controller_addr[1],
+            controller_addr[2],
+            controller_addr[3],
+            controller_addr[4],
+        ]) << 24
+            | 1;
+        node.join_network(NetworkMembership::new(network_id, 2800));
+        add_active_peer(
+            &mut node,
+            controller,
+            "10.0.0.60:9993".parse().unwrap(),
+            [1; 48],
+        );
+        let talker = add_active_peer(
+            &mut node,
+            test_identity(0x61),
+            "10.0.0.61:9993".parse().unwrap(),
+            [2; 48],
+        );
+        let learned = test_identity(0x62);
+        let learned_addr = *learned.address.as_bytes();
+        node.topology.add_peer(learned);
+
+        node.tick(1_000);
+        assert!(node.topology.get_peer(&learned_addr).is_some());
+
+        node.tick(1_000 + ZT_PEER_ACTIVITY_TIMEOUT);
+        assert!(node.topology.get_peer(&learned_addr).is_none());
+        assert!(node.topology.get_peer(&talker).is_none());
+        assert!(node.topology.get_peer(&root).is_some());
+        assert!(node.topology.get_peer(&controller_addr).is_some());
     }
 }
