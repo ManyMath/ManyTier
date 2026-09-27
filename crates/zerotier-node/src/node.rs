@@ -6578,4 +6578,44 @@ mod tests {
             "the external address must be pushed to network peers"
         );
     }
+
+    /// A full HELLO / OK(HELLO) exchange between two nodes establishes the
+    /// session on the side that sent the HELLO: the reply must name the
+    /// HELLO's packet ID, or the expected-reply gate drops it.
+    #[test]
+    fn hello_handshake_between_two_nodes_establishes_a_session() {
+        let mut rng = XorShift17_11(0x4853);
+        let planet = make_synthetic_planet();
+        let mut a = Node::new(Identity::generate(&mut rng).unwrap(), &planet, 1).unwrap();
+        let mut b = Node::new(Identity::generate(&mut rng).unwrap(), &planet, 100).unwrap();
+        let a_socket: SocketAddr = "198.51.100.1:9993".parse().unwrap();
+        let b_socket: SocketAddr = "198.51.100.2:9993".parse().unwrap();
+        let b_address = *b.identity.address.as_bytes();
+        a.topology.add_peer(Identity {
+            address: b.identity.address,
+            public_key: b.identity.public_key.clone(),
+            secret: None,
+        });
+
+        a.send_probe_hello(&b_address, b_socket, 1_000, "test");
+        let hellos = a.drain_actions();
+        let NodeAction::SendTo { data, .. } = &hellos[0] else {
+            panic!("expected a HELLO, got {hellos:?}");
+        };
+        let mut hello = data.clone();
+        let replies = b.receive_packet(&mut hello, a_socket, 1_010);
+        let NodeAction::SendTo { data, address } = &replies[0] else {
+            panic!("expected OK(HELLO), got {replies:?}");
+        };
+        assert_eq!(*address, a_socket);
+        let mut ok = data.clone();
+        a.receive_packet(&mut ok, b_socket, 1_020);
+
+        let peer = a.topology.get_peer(&b_address).unwrap();
+        assert!(
+            matches!(peer.state, PeerState::Active { latency_ms: 20, .. }),
+            "session must be established from the OK(HELLO), got {:?}",
+            peer.state
+        );
+    }
 }
