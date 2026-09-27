@@ -132,6 +132,80 @@ impl Topology {
         true
     }
 
+    /// Whether `address` may send us planet and moon updates: it is a root
+    /// of our planet or of a moon we orbit
+    /// (ZeroTierOne Topology::shouldAcceptWorldUpdateFrom).
+    pub fn accepts_world_updates_from(&self, address: &[u8; 5]) -> bool {
+        self.planet.iter().chain(self.moons.iter()).any(|world| {
+            world
+                .roots
+                .iter()
+                .any(|r| r.identity.address.as_bytes() == address)
+        })
+    }
+
+    /// Replace our planet or one of our moons with `update` if it is a valid
+    /// successor (same ID, newer, signed by the key the current one names).
+    /// Established sessions with roots are kept; roots no longer listed by
+    /// any world stop being roots. Returns whether anything changed.
+    pub fn apply_world_update(&mut self, update: World) -> bool {
+        let slot = match update.world_type {
+            zerotier_protocol::world::WorldType::Planet => self.planet.as_mut(),
+            zerotier_protocol::world::WorldType::Moon => {
+                self.moons.iter_mut().find(|moon| moon.id == update.id)
+            }
+            zerotier_protocol::world::WorldType::Null => None,
+        };
+        let Some(current) = slot else {
+            return false;
+        };
+        if !update.is_valid_update_of(current) {
+            return false;
+        }
+        *current = update;
+        self.rebuild_roots();
+        true
+    }
+
+    /// Recompute the root set from the planet and moons, creating peers for
+    /// new roots and adding any new endpoints to existing ones.
+    fn rebuild_roots(&mut self) {
+        let worlds: Vec<&World> = self.planet.iter().chain(self.moons.iter()).collect();
+        let mut roots = Vec::new();
+        let mut entries = Vec::new();
+        for world in worlds {
+            for root in &world.roots {
+                let address = *root.identity.address.as_bytes();
+                if !roots.contains(&address) {
+                    roots.push(address);
+                }
+                entries.push((address, root.identity.clone(), root.endpoints.clone()));
+            }
+        }
+        for (address, peer) in self.peers.iter_mut() {
+            peer.is_root = roots.contains(address);
+        }
+        for (address, identity, endpoints) in entries {
+            let peer = self.peers.entry(address).or_insert_with(|| {
+                Peer::new(
+                    Identity {
+                        address: identity.address,
+                        public_key: identity.public_key.clone(),
+                        secret: None,
+                    },
+                    true,
+                )
+            });
+            peer.is_root = true;
+            for endpoint in endpoints.iter().filter_map(|e| e.to_socket_addr()) {
+                if !peer.paths.iter().any(|path| path.address == endpoint) {
+                    peer.add_path(endpoint, true, 0);
+                }
+            }
+        }
+        self.roots = roots;
+    }
+
     /// Get a peer by address.
     pub fn get_peer(&self, address: &[u8; 5]) -> Option<&Peer> {
         self.peers.get(address)
@@ -344,5 +418,57 @@ mod tests {
 
         // Unknown moon IDs report false.
         assert!(!topo.unload_moon(0xdead_beef));
+    }
+
+    #[test]
+    fn a_signed_newer_moon_replaces_the_current_one() {
+        let mut topo = Topology::new();
+        let old_root = build_test_identity(0xe1);
+        let old_root_addr = *old_root.address.as_bytes();
+        let endpoint = |last: u8| InetAddress::V4 {
+            ip: [203, 0, 113, last],
+            port: 9993,
+        };
+        topo.load_moon(signed_test_world(
+            WorldType::Moon,
+            0x77,
+            1000,
+            alloc::vec![WorldRoot {
+                identity: old_root,
+                endpoints: alloc::vec![endpoint(1)],
+            }],
+        ))
+        .unwrap();
+        assert!(topo.accepts_world_updates_from(&old_root_addr));
+
+        let new_root_addr = *build_test_identity(0xe2).address.as_bytes();
+        let update = || {
+            signed_test_world(
+                WorldType::Moon,
+                0x77,
+                2000,
+                alloc::vec![WorldRoot {
+                    identity: build_test_identity(0xe2),
+                    endpoints: alloc::vec![endpoint(2)],
+                }],
+            )
+        };
+
+        // Not newer: rejected.
+        let mut stale = update();
+        stale.timestamp = 1000;
+        assert!(!topo.apply_world_update(stale));
+
+        // Signed by a different key: rejected.
+        let mut forged = update();
+        forged.signature[0] ^= 0xff;
+        assert!(!topo.apply_world_update(forged));
+
+        assert!(topo.apply_world_update(update()));
+        assert_eq!(topo.moons[0].timestamp, 2000);
+        assert!(topo.roots.contains(&new_root_addr));
+        assert!(!topo.roots.contains(&old_root_addr));
+        assert!(topo.get_peer(&new_root_addr).unwrap().is_root);
+        assert!(!topo.get_peer(&old_root_addr).unwrap().is_root);
     }
 }

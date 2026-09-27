@@ -46,6 +46,9 @@ pub enum ManyTierFfiActionKind {
     RemoteTraceReceived = 8,
     PathNegotiationReceived = 9,
     DestinationUnknown = 10,
+    /// A root replaced our planet or a moon; `data` is the world to store,
+    /// `network_id` its world ID and `type_id` 1 for a moon, 0 for a planet.
+    WorldUpdated = 11,
 }
 
 /// Socket address encoded for C callers.
@@ -563,6 +566,18 @@ fn action_view(action: &NodeAction) -> ManyTierFfiActionView {
             kind: ManyTierFfiActionKind::PathNegotiationReceived,
             zt_address: *origin,
             utility: *utility,
+            ..ManyTierFfiActionView::default()
+        },
+        NodeAction::WorldUpdated {
+            world_id,
+            is_moon,
+            data,
+        } => ManyTierFfiActionView {
+            kind: ManyTierFfiActionKind::WorldUpdated,
+            data_ptr: data.as_ptr(),
+            data_len: data.len(),
+            network_id: *world_id,
+            type_id: u64::from(*is_moon),
             ..ManyTierFfiActionView::default()
         },
     }

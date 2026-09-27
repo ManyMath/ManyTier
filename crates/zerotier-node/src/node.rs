@@ -20,7 +20,7 @@ use zerotier_protocol::inet_address::InetAddress;
 use zerotier_protocol::verb::Verb;
 use zerotier_protocol::verbs::ack::AckPayload;
 use zerotier_protocol::verbs::hello::{
-    HelloPayload, HelloWorld, MANYTIER_ADVERTISED_PROTOCOL_VERSION,
+    deserialize_hello_worlds, HelloPayload, HelloWorld, MANYTIER_ADVERTISED_PROTOCOL_VERSION,
 };
 use zerotier_protocol::verbs::network_config::{
     CertificateOfMembership, NetworkConfigPayload, NetworkCredentialsPayload,
@@ -32,6 +32,7 @@ use zerotier_protocol::verbs::remote_trace::RemoteTracePayload;
 use zerotier_protocol::verbs::rendezvous::RendezvousPayload;
 use zerotier_protocol::verbs::user_message::UserMessagePayload;
 use zerotier_protocol::verbs::whois::WhoisRequest;
+use zerotier_protocol::world::{World, WorldType};
 use zerotier_protocol::{is_fragment, FragmentHeader, PacketHeader, ProtocolError};
 
 use crate::controller::dictionary::Dictionary;
@@ -101,6 +102,14 @@ pub enum NodeAction {
     RemoteTraceReceived { origin: [u8; 5], data: Vec<u8> },
     /// A PATH_NEGOTIATION_REQUEST (verb 0x16) was received.
     PathNegotiationReceived { origin: [u8; 5], utility: i16 },
+    /// A root sent a newer, validly signed version of our planet or of a
+    /// moon we orbit, and it replaced the old one. `data` is the world in
+    /// its stored format; the host should save it.
+    WorldUpdated {
+        world_id: u64,
+        is_moon: bool,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -347,6 +356,33 @@ impl Node {
         packet_id
     }
 
+    /// Apply the valid successors among back-to-back serialized worlds and
+    /// report each one so the host can store it.
+    fn apply_world_updates(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let Ok((world, used)) = World::deserialize_prefix(data) else {
+                return;
+            };
+            let serialized = data[..used].to_vec();
+            data = &data[used..];
+            let (world_type, world_id) = (world.world_type, world.id);
+            if self.topology.apply_world_update(world) {
+                tracing::info!(
+                    target: "manytier",
+                    event = "world_updated",
+                    world_id = %format_args!("{world_id:016x}"),
+                    world_type = ?world_type,
+                    "applied a newer planet/moon from a root"
+                );
+                self.actions.push(NodeAction::WorldUpdated {
+                    world_id,
+                    is_moon: world_type == WorldType::Moon,
+                    data: serialized,
+                });
+            }
+        }
+    }
+
     /// The worlds we orbit, as listed at the end of our HELLOs.
     fn hello_worlds(&self) -> Vec<HelloWorld> {
         self.topology
@@ -358,6 +394,35 @@ impl Node {
                 timestamp: moon.timestamp,
             })
             .collect()
+    }
+
+    /// Serialized worlds to put in an OK(HELLO): our planet if the sender
+    /// has an older version of it, and each moon it listed that we hold a
+    /// newer version of.
+    fn world_updates_for(
+        &self,
+        planet_id: u64,
+        planet_timestamp: u64,
+        listed: &[HelloWorld],
+    ) -> Vec<u8> {
+        let planet = self
+            .topology
+            .planet
+            .iter()
+            .filter(|planet| planet.id == planet_id && planet.timestamp > planet_timestamp);
+        let moons = self.topology.moons.iter().filter(|moon| {
+            listed.iter().any(|w| {
+                w.id == moon.id && w.world_type == WORLD_TYPE_MOON && moon.timestamp > w.timestamp
+            })
+        });
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        for world in planet.chain(moons) {
+            if let Ok(len) = world.serialize(&mut buf) {
+                out.extend_from_slice(&buf[..len]);
+            }
+        }
+        out
     }
 
     /// Did we send a request with this packet ID (recently enough)?
@@ -1349,7 +1414,7 @@ impl Node {
     fn handle_hello(&mut self, data: &[u8], from: SocketAddr, now_ms: u64, packet_id: u64) {
         // Parse HELLO payload (after verb byte, offset 28)
         let payload_data = if data.len() > 28 { &data[28..] } else { return };
-        let (hello, _) = match HelloPayload::deserialize(payload_data) {
+        let (hello, hello_len) = match HelloPayload::deserialize(payload_data) {
             Ok(h) => h,
             Err(_) => return,
         };
@@ -1460,9 +1525,32 @@ impl Node {
                 "HELLO accepted"
             );
 
+            // Newer versions of the worlds the sender listed, if we have them
+            // (ZeroTierOne _doHELLO); the list is encrypted with cryptField.
+            let mut listed = data.to_vec();
+            let worlds_at = 28 + hello_len;
+            let listed_worlds = if worlds_at < listed.len()
+                && salsa::crypt_packet_field(
+                    &shared_secret,
+                    &mut listed,
+                    worlds_at,
+                    data.len() - worlds_at,
+                )
+                .is_ok()
+            {
+                deserialize_hello_worlds(&listed[worlds_at..])
+            } else {
+                Vec::new()
+            };
+            let worlds = self.world_updates_for(
+                hello.planet_world_id,
+                hello.planet_world_timestamp,
+                &listed_worlds,
+            );
+
             // Build and send OK(HELLO) response
             let reply_id = self.allocate_packet_id();
-            let mut buf = [0u8; 512];
+            let mut buf = vec![0u8; 128 + worlds.len()];
             if let Ok(len) = RootManager::build_ok_hello(
                 &self.identity,
                 &source_addr_bytes,
@@ -1472,7 +1560,7 @@ impl Node {
                 reply_id,
                 false,
                 Some(from),
-                &[],
+                &worlds,
                 &mut buf,
             ) {
                 self.actions.push(NodeAction::SendTo {
@@ -1517,8 +1605,15 @@ impl Node {
             OkSubPayload::Hello {
                 timestamp_echo,
                 external_address,
+                worlds,
                 ..
             } => {
+                // Planet and moon updates, only from their roots
+                // (Topology::shouldAcceptWorldUpdateFrom).
+                if !worlds.is_empty() && self.topology.accepts_world_updates_from(&ok_source) {
+                    self.apply_world_updates(&worlds);
+                }
+
                 // Compute latency from timestamp echo
                 let latency_ms = now_ms.saturating_sub(timestamp_echo) as u32;
 
@@ -6617,5 +6712,63 @@ mod tests {
             "session must be established from the OK(HELLO), got {:?}",
             peer.state
         );
+    }
+
+    /// A root holding a newer version of a moon a client orbits sends it in
+    /// its OK(HELLO); the client checks the signature against the old
+    /// version's key, switches to it and reports it for storage.
+    #[test]
+    fn root_pushes_a_newer_moon_in_ok_hello() {
+        use zerotier_protocol::world::WorldRoot;
+
+        let mut rng = XorShift17_11(0x574f);
+        let planet = make_synthetic_planet();
+        let root_identity = Identity::generate(&mut rng).unwrap();
+        let root_address = *root_identity.address.as_bytes();
+        let root_socket: SocketAddr = "203.0.113.70:9993".parse().unwrap();
+        let client_socket: SocketAddr = "198.51.100.71:9993".parse().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x24; 32]);
+        let mut public_key = [0u8; 64];
+        public_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        let moon = |timestamp: u64| {
+            let bytes = crate::controller::world_gen::generate_moon(
+                0x0000_00aa_bbcc_ddee,
+                timestamp,
+                vec![WorldRoot {
+                    identity: Identity {
+                        address: root_identity.address,
+                        public_key: root_identity.public_key.clone(),
+                        secret: None,
+                    },
+                    endpoints: vec![InetAddress::from_socket_addr(root_socket)],
+                }],
+                &signing_key,
+                &public_key,
+            );
+            World::deserialize(&bytes).unwrap()
+        };
+
+        let mut client = Node::new(Identity::generate(&mut rng).unwrap(), &planet, 1).unwrap();
+        client.topology.load_moon(moon(1_000)).unwrap();
+        let mut root = Node::new(root_identity.clone(), &planet, 50).unwrap();
+        root.topology.load_moon(moon(2_000)).unwrap();
+
+        client.send_probe_hello(&root_address, root_socket, 5_000, "test");
+        let hello = client.drain_actions();
+        let NodeAction::SendTo { data, .. } = &hello[0] else {
+            panic!("expected HELLO");
+        };
+        let replies = root.receive_packet(&mut data.clone(), client_socket, 5_010);
+        let NodeAction::SendTo { data, .. } = &replies[0] else {
+            panic!("expected OK(HELLO), got {replies:?}");
+        };
+        let actions = client.receive_packet(&mut data.clone(), root_socket, 5_020);
+
+        assert_eq!(client.topology.moons[0].timestamp, 2_000);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            NodeAction::WorldUpdated { world_id: 0x0000_00aa_bbcc_ddee, is_moon: true, data }
+                if World::deserialize(data).is_ok_and(|w| w.timestamp == 2_000)
+        )));
     }
 }

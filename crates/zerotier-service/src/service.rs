@@ -317,6 +317,7 @@ pub async fn run_service(config: ServiceConfig) -> anyhow::Result<()> {
                             .await;
                         handle_tun_actions(&pending, &mut tun_devices, &tun_tx, local_zt_address, &tun_names)
                             .await;
+                        store_world_updates(&config.data_dir, &actions).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "UDP recv error");
@@ -1127,6 +1128,48 @@ fn tun_name_for_network(network_id: u64, local_zt_address: [u8; 5]) -> String {
         local_zt_address[4],
     ]);
     format!("zt{network_suffix:06x}{node_suffix:06x}")
+}
+
+/// Save the planets and moons a root replaced where the next start loads
+/// them: `moons.d/<id>.moon`, and `planet.bin` if present, else `planet`.
+async fn store_world_updates(data_dir: &str, actions: &[NodeAction]) {
+    for action in actions {
+        let NodeAction::WorldUpdated {
+            world_id,
+            is_moon,
+            data,
+        } = action
+        else {
+            continue;
+        };
+        let dir = PathBuf::from(data_dir);
+        let path = if *is_moon {
+            dir.join("moons.d").join(format!("{world_id:016x}.moon"))
+        } else if tokio::fs::try_exists(dir.join("planet.bin"))
+            .await
+            .unwrap_or(false)
+        {
+            dir.join("planet.bin")
+        } else {
+            dir.join("planet")
+        };
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match tokio::fs::write(&path, data).await {
+            Ok(()) => tracing::info!(
+                world_id = %format!("{world_id:016x}"),
+                path = %path.display(),
+                "stored updated world"
+            ),
+            Err(error) => tracing::warn!(
+                world_id = %format!("{world_id:016x}"),
+                path = %path.display(),
+                error = %error,
+                "failed to store updated world"
+            ),
+        }
+    }
 }
 
 /// Load an identity from native storage, or generate a new one and save it.

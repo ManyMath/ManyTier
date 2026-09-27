@@ -1291,6 +1291,13 @@ async fn execute_actions(transport: &zerotier_service::NativeTransport, actions:
                     "PATH_NEGOTIATION_REQUEST received"
                 );
             }
+            NodeAction::WorldUpdated { world_id, .. } => {
+                tracing::debug!(
+                    world_id = %format!("{world_id:016x}"),
+                    event = "world_updated_action",
+                    "planet/moon updated by a root"
+                );
+            }
         }
     }
 }

@@ -91,7 +91,13 @@ impl World {
         } else {
             data
         };
+        Self::deserialize_prefix(body).map(|(world, _)| world)
+    }
 
+    /// Parse one world from the start of `body`, which may hold more data
+    /// after it (worlds travel back to back in OK(HELLO)). Returns the world
+    /// and the number of bytes it occupied.
+    pub fn deserialize_prefix(body: &[u8]) -> Result<(Self, usize), ProtocolError> {
         if body.len() < WORLD_MIN_SIZE {
             return Err(ProtocolError::TooShort {
                 need: WORLD_MIN_SIZE,
@@ -193,21 +199,23 @@ impl World {
             }
             let dict = body[pos..pos + dict_len].to_vec();
             pos += dict_len;
-            let _ = pos; // suppress unused warning
             Some(dict)
         } else {
             None
         };
 
-        Ok(World {
-            world_type,
-            id,
-            timestamp,
-            signing_key,
-            signature,
-            roots,
-            dict_data,
-        })
+        Ok((
+            World {
+                world_type,
+                id,
+                timestamp,
+                signing_key,
+                signature,
+                roots,
+                dict_data,
+            },
+            pos,
+        ))
     }
 
     /// Serialize this world definition to binary format.
@@ -351,7 +359,23 @@ impl World {
     /// itself prove the embedded key is one the operator has chosen to trust
     /// (that requires out-of-band key pinning, which is a separate concern).
     pub fn verify_signature(&self) -> Result<(), ProtocolError> {
-        let verifying_key_bytes: [u8; 32] = self.signing_key[32..64]
+        self.verify_signed_by(&self.signing_key)
+    }
+
+    /// Whether this world may replace `current`: same type and ID, newer,
+    /// and signed by the key `current` names for its successors
+    /// (ZeroTierOne World::shouldBeReplacedBy).
+    pub fn is_valid_update_of(&self, current: &World) -> bool {
+        self.world_type == current.world_type
+            && self.id == current.id
+            && self.timestamp > current.timestamp
+            && self.verify_signed_by(&current.signing_key).is_ok()
+    }
+
+    /// Verify the signature against a C25519 public key pair, whose
+    /// Ed25519 half is the last 32 bytes.
+    pub fn verify_signed_by(&self, signing_key: &[u8; 64]) -> Result<(), ProtocolError> {
+        let verifying_key_bytes: [u8; 32] = signing_key[32..64]
             .try_into()
             .map_err(|_| ProtocolError::InvalidPacket)?;
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&verifying_key_bytes)
