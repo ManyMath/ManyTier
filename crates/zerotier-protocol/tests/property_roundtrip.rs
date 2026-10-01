@@ -157,6 +157,7 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
         let ext = ExtFramePayload {
             network_id: seed,
             flags: (seed & 0xff) as u8,
+            com: None,
             dest_mac: make_bytes(seed, 6).try_into().unwrap(),
             src_mac: make_bytes(seed ^ 1, 6).try_into().unwrap(),
             ethertype: (seed >> 8) as u16,
@@ -210,6 +211,7 @@ fn protocol_roundtrips_cover_all_payload_codecs() {
         let multicast_frame = MulticastFramePayload {
             network_id: seed,
             flags: 0x06,
+            com: None,
             gather_limit: Some(seed as u32),
             source_mac: Some(make_bytes(seed ^ 3, 6).try_into().unwrap()),
             dest_mac: make_bytes(seed ^ 4, 6).try_into().unwrap(),

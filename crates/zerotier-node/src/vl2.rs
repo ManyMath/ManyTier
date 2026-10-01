@@ -182,6 +182,7 @@ pub fn handle_ext_frame(
         Ok(e) => e,
         Err(_) => return,
     };
+    note_inline_com(node, ext.network_id, sender_address, ext.com.clone());
 
     // Find the network
     let network = match node.find_network(ext.network_id) {
@@ -379,6 +380,7 @@ pub fn handle_multicast_frame(
         Ok(m) => m,
         Err(_) => return,
     };
+    note_inline_com(node, mf.network_id, sender_address, mf.com.clone());
 
     // Find the network
     let network = match node.find_network(mf.network_id) {
@@ -647,6 +649,7 @@ fn send_unicast_frame(
     let ext = ExtFramePayload {
         network_id,
         flags: 0,
+        com: None,
         dest_mac: member_mac,
         src_mac: our_mac,
         ethertype,
@@ -704,6 +707,7 @@ fn send_multicast_frame(
     let frame = MulticastFramePayload {
         network_id,
         flags: 0,
+        com: None,
         gather_limit: None,
         source_mac: None,
         dest_mac: group_mac,
@@ -845,6 +849,33 @@ fn is_directed_broadcast_v4(
         }
         _ => false,
     })
+}
+
+/// A COM sent inside a frame (flag 0x01, deprecated but still sent by
+/// older peers) is the sender's credential, as if it had arrived in
+/// NETWORK_CREDENTIALS (ZeroTierOne `network->addCredential(com)`). It is
+/// verified when the frame is gated.
+fn note_inline_com(
+    node: &mut Node,
+    network_id: u64,
+    sender_address: &[u8; 5],
+    com: Option<zerotier_protocol::verbs::network_config::CertificateOfMembership>,
+) {
+    let Some(com) = com else {
+        return;
+    };
+    let for_network = com
+        .qualifiers
+        .iter()
+        .any(|q| q.id == 1 && q.value == network_id);
+    if com.issued_to != *sender_address || !for_network {
+        return;
+    }
+    if let Some(net) = node.find_network_mut(network_id) {
+        net.peer_coms
+            .retain(|(address, _)| address != sender_address);
+        net.peer_coms.push((*sender_address, com));
+    }
 }
 
 /// Check if a peer has a valid COM stored in the network's peer_coms list,
@@ -1068,6 +1099,7 @@ mod tests {
         let ext = ExtFramePayload {
             network_id,
             flags: 0,
+            com: None,
             dest_mac: our_mac,
             src_mac: sender_mac,
             ethertype: 0x0800,
@@ -1403,6 +1435,7 @@ mod tests {
         let ext = ExtFramePayload {
             network_id,
             flags: 0,
+            com: None,
             dest_mac: our_mac,
             src_mac: ethernet::derive_mac(&sender_address, network_id),
             ethertype: 0x0800,
@@ -1557,6 +1590,7 @@ mod tests {
         let frame = MulticastFramePayload {
             network_id,
             flags: 0,
+            com: None,
             gather_limit: None,
             source_mac: None,
             dest_mac: mac,
@@ -1741,5 +1775,50 @@ mod tests {
         v6[0] = 0x60;
         v6[24..40].copy_from_slice(&"ff02::fb".parse::<core::net::Ipv6Addr>().unwrap().octets());
         assert_eq!(send(&mut node, 0x86dd, &v6), vec![(v6_group, 0)]);
+    }
+
+    /// An EXT_FRAME carrying the sender's COM inline (flag 0x01) is
+    /// accepted without a separate NETWORK_CREDENTIALS.
+    #[test]
+    fn ext_frame_with_inline_com_is_accepted() {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, signing_key, controller_address) = make_node_with_com(network_id);
+        let sender = test_identity(0x47);
+        let sender_address = *sender.address.as_bytes();
+        let from: SocketAddr = "10.0.0.50:9993".parse().unwrap();
+        node.topology.add_peer(sender);
+        {
+            let peer = node.topology.get_peer_mut(&sender_address).unwrap();
+            peer.add_path(from, true, 1000);
+            peer.state = PeerState::new_active([0x5a; 48], 10, 1000, 1000);
+        }
+        let com = crate::controller::engine::build_signed_com(
+            &signing_key,
+            &controller_address,
+            network_id,
+            crate::controller::engine::zt_address_to_u64(&sender_address),
+            1050,
+        );
+        let our_mac = node
+            .find_network(network_id)
+            .unwrap()
+            .our_mac(node.identity.address.as_bytes());
+        let ext = ExtFramePayload {
+            network_id,
+            flags: 0,
+            com: Some(com),
+            dest_mac: our_mac,
+            src_mac: ethernet::derive_mac(&sender_address, network_id),
+            ethertype: 0x0800,
+            payload: &[0x45, 0, 0, 20],
+        };
+        let mut buf = [0u8; 512];
+        let n = ext.serialize(&mut buf);
+
+        handle_ext_frame(&mut node, &sender_address, &buf[..n], from, 2000, 1);
+        assert!(node
+            .drain_actions()
+            .iter()
+            .any(|a| matches!(a, NodeAction::FrameReceived { .. })));
     }
 }

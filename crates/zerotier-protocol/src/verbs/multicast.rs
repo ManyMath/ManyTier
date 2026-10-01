@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use crate::error::ProtocolError;
+use crate::verbs::network_config::CertificateOfMembership;
 use alloc::vec::Vec;
 
 /// A single multicast group subscription entry.
@@ -152,6 +153,8 @@ impl MulticastGatherPayload {
 pub struct MulticastFramePayload<'a> {
     pub network_id: u64,
     pub flags: u8,
+    /// A certificate of membership sent along (flag 0x01, deprecated).
+    pub com: Option<CertificateOfMembership>,
     pub gather_limit: Option<u32>,
     pub source_mac: Option<[u8; 6]>,
     pub dest_mac: [u8; 6],
@@ -174,6 +177,15 @@ impl<'a> MulticastFramePayload<'a> {
         ]);
         let flags = data[8];
         let mut offset = 9;
+
+        // ZeroTierOne _doMULTICAST_FRAME: the COM comes first when flagged.
+        let com = if flags & 0x01 != 0 {
+            let (com, used) = CertificateOfMembership::deserialize(&data[offset..])?;
+            offset += used;
+            Some(com)
+        } else {
+            None
+        };
 
         let gather_limit = if flags & 0x02 != 0 {
             if offset + 4 > data.len() {
@@ -234,6 +246,7 @@ impl<'a> MulticastFramePayload<'a> {
         Ok(MulticastFramePayload {
             network_id,
             flags,
+            com,
             gather_limit,
             source_mac,
             dest_mac,
@@ -248,9 +261,13 @@ impl<'a> MulticastFramePayload<'a> {
         let mut offset = 0;
         buf[offset..offset + 8].copy_from_slice(&self.network_id.to_be_bytes());
         offset += 8;
-        buf[offset] = self.flags;
+        buf[offset] = self.flags & !0x01;
         offset += 1;
 
+        if let Some(com) = &self.com {
+            buf[8] |= 0x01;
+            offset += com.serialize(&mut buf[offset..]);
+        }
         if let Some(gl) = self.gather_limit {
             buf[offset..offset + 4].copy_from_slice(&gl.to_be_bytes());
             offset += 4;
@@ -367,6 +384,7 @@ mod tests {
         let payload = MulticastFramePayload {
             network_id: 0x1234567890abcdef,
             flags: 0x00,
+            com: None,
             gather_limit: None,
             source_mac: None,
             dest_mac: [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01],
@@ -395,6 +413,7 @@ mod tests {
         let payload = MulticastFramePayload {
             network_id: 1,
             flags: 0x02,
+            com: None,
             gather_limit: Some(256),
             source_mac: None,
             dest_mac: [0xff; 6],
@@ -417,6 +436,7 @@ mod tests {
         let payload = MulticastFramePayload {
             network_id: 1,
             flags: 0x04,
+            com: None,
             gather_limit: None,
             source_mac: Some([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]),
             dest_mac: [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01],
@@ -442,6 +462,7 @@ mod tests {
         let payload = MulticastFramePayload {
             network_id: 0xdeadbeef,
             flags: 0x06, // gather_limit + source_mac
+            com: None,
             gather_limit: Some(1000),
             source_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
             dest_mac: [0x33, 0x33, 0x00, 0x00, 0x00, 0x01],
@@ -466,5 +487,48 @@ mod tests {
     #[test]
     fn multicast_frame_too_short() {
         assert!(MulticastFramePayload::parse(&[0; 8]).is_err());
+    }
+
+    /// With flag 0x01 the COM comes before the gather limit and source MAC
+    /// (ZeroTierOne _doMULTICAST_FRAME).
+    #[test]
+    fn multicast_frame_with_inline_com_roundtrip() {
+        let com = CertificateOfMembership {
+            issued_to: [1, 2, 3, 4, 5],
+            qualifiers: alloc::vec![
+                crate::verbs::network_config::ComQualifier {
+                    id: 0,
+                    value: 42,
+                    max_delta: 10,
+                },
+                crate::verbs::network_config::ComQualifier {
+                    id: 2,
+                    value: 0x01_0203_0405,
+                    max_delta: 0,
+                },
+            ],
+            signer_address: [6, 7, 8, 9, 10],
+            signature: [0x5a; 96],
+        };
+        let data = [0xCC; 3];
+        let payload = MulticastFramePayload {
+            network_id: 1,
+            flags: 0x02,
+            com: Some(com.clone()),
+            gather_limit: Some(7),
+            source_mac: None,
+            dest_mac: [0xff; 6],
+            adi: 9,
+            ethertype: 0x0806,
+            payload: &data,
+        };
+        let mut buf = [0u8; 512];
+        let n = payload.serialize(&mut buf);
+        assert_eq!(buf[8], 0x03);
+        let parsed = MulticastFramePayload::parse(&buf[..n]).unwrap();
+        assert_eq!(parsed.com, Some(com));
+        assert_eq!(parsed.gather_limit, Some(7));
+        assert_eq!(parsed.adi, 9);
+        assert_eq!(parsed.payload, &data[..]);
     }
 }
