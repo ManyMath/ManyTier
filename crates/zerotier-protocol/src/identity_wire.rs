@@ -49,7 +49,12 @@ pub fn deserialize_identity(data: &[u8]) -> Result<(Identity, usize), ProtocolEr
     pub_bytes[32..].copy_from_slice(&data[38..70]);
     let public_key = PublicKey::from_bytes(&pub_bytes).map_err(ProtocolError::CryptoError)?;
 
+    // Either no private key or a full C25519 pair (ZeroTierOne
+    // Identity::deserialize rejects any other length).
     let secret_len = data[70] as usize;
+    if secret_len != 0 && secret_len != 64 {
+        return Err(ProtocolError::InvalidPacket);
+    }
     let consumed = IDENTITY_PUBLIC_WIRE_LEN + secret_len;
 
     if data.len() < consumed {
@@ -164,5 +169,20 @@ mod tests {
         buf[5] = IDENTITY_TYPE_C25519;
         buf[70] = 0x00;
         assert!(deserialize_identity(&buf[..71]).is_err());
+    }
+
+    /// A private key is either absent or a full 64-byte C25519 pair.
+    #[test]
+    fn private_key_length_must_be_0_or_64() {
+        let mut buf = [0u8; 256];
+        let n = serialize_identity_public(&stub_identity(), &mut buf);
+        assert!(deserialize_identity(&buf[..n]).is_ok());
+        buf[70] = 32;
+        assert!(matches!(
+            deserialize_identity(&buf[..n + 32]),
+            Err(ProtocolError::InvalidPacket)
+        ));
+        buf[70] = 64;
+        assert_eq!(deserialize_identity(&buf[..n + 64]).unwrap().1, n + 64);
     }
 }
