@@ -66,6 +66,20 @@ impl InetAddress {
                 let port = u16::from_be_bytes([data[17], data[18]]);
                 Ok((InetAddress::V6 { ip, port }, 19))
             }
+            // Types ZeroTier One reserves for future use and accepts by
+            // skipping them (InetAddress::deserialize): 0x01/0x02 are seven
+            // bytes, 0x03 carries its own u16 length.
+            0x01 | 0x02 if data.len() >= 7 => Ok((InetAddress::Null, 7)),
+            0x03 if data.len() >= 3 => {
+                let used = 3 + u16::from_be_bytes([data[1], data[2]]) as usize;
+                if data.len() < used {
+                    return Err(ProtocolError::TooShort {
+                        need: used,
+                        got: data.len(),
+                    });
+                }
+                Ok((InetAddress::Null, used))
+            }
             _ => Err(ProtocolError::InvalidPacket),
         }
     }
@@ -219,5 +233,21 @@ mod tests {
         addr.serialize(&mut buf);
         assert_eq!(buf[5], 0x12);
         assert_eq!(buf[6], 0x34);
+    }
+
+    /// Reserved address types are skipped, not rejected, so a peer sending
+    /// a newer type does not break the whole message.
+    #[test]
+    fn reserved_address_types_are_skipped() {
+        assert_eq!(
+            InetAddress::deserialize(&[0x01, 1, 2, 3, 4, 5, 6, 0xaa]).unwrap(),
+            (InetAddress::Null, 7)
+        );
+        assert_eq!(
+            InetAddress::deserialize(&[0x03, 0, 2, 9, 9, 0xaa]).unwrap(),
+            (InetAddress::Null, 5)
+        );
+        assert!(InetAddress::deserialize(&[0x03, 0, 9, 1]).is_err());
+        assert!(InetAddress::deserialize(&[0x05]).is_err());
     }
 }
