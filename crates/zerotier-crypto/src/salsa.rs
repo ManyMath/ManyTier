@@ -83,6 +83,12 @@ pub fn armor_packet(
         return Err(CryptoError::InvalidFormat);
     }
 
+    // The cipher suite bits must say what was done, or the receiver will
+    // not decrypt; set them as ZeroTierOne's Packet::armor does, before
+    // they are mixed into the key.
+    let suite: u8 = if encrypt_payload { 1 } else { 0 };
+    packet[PACKET_FLAGS_OFFSET] = (packet[PACKET_FLAGS_OFFSET] & !0x38) | (suite << 3);
+
     let mangled = mangle_key(shared_secret, packet, packet.len());
 
     // Nonce is 8 bytes from packet[0..8] (the IV/Packet ID field)
@@ -588,5 +594,22 @@ mod tests {
         dearmor_packet(&secret, &mut pkt).unwrap();
 
         assert_eq!(pkt[27], original_verb);
+    }
+
+    /// armor_packet sets the cipher suite bits to match what it does, so a
+    /// caller cannot produce a packet the receiver would not decrypt.
+    #[test]
+    fn armor_sets_the_cipher_suite_bits() {
+        let secret = test_shared_secret();
+        let mut packet = make_test_packet(0);
+        packet[PACKET_FLAGS_OFFSET] |= 0x02; // hops survive
+        armor_packet(&secret, &mut packet, true).unwrap();
+        assert_eq!(packet[PACKET_FLAGS_OFFSET] & 0x38, 1 << 3);
+        assert_eq!(packet[PACKET_FLAGS_OFFSET] & 0x07, 0x02);
+        assert!(dearmor_packet(&secret, &mut packet).is_ok());
+
+        let mut packet = make_test_packet(1);
+        armor_packet(&secret, &mut packet, false).unwrap();
+        assert_eq!(packet[PACKET_FLAGS_OFFSET] & 0x38, 0);
     }
 }
