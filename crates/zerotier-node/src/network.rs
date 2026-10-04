@@ -375,6 +375,11 @@ fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
 }
 
 fn peer_com_agrees_with(ours: &CertificateOfMembership, theirs: &CertificateOfMembership) -> bool {
+    // A certificate with no qualifiers agrees with nothing
+    // (ZeroTierOne CertificateOfMembership::agreesWith).
+    if ours.qualifiers.is_empty() || theirs.qualifiers.is_empty() {
+        return false;
+    }
     for our_q in &ours.qualifiers {
         // `issued_to` is peer-specific and must not be compared across members.
         if our_q.id == 2 {
@@ -396,6 +401,9 @@ fn peer_com_agrees_with(ours: &CertificateOfMembership, theirs: &CertificateOfMe
 /// Check if two COMs agree: all qualifiers in `ours` must have a matching
 /// qualifier (by ID) in `theirs` with |value difference| <= max_delta.
 pub fn com_agrees_with(ours: &CertificateOfMembership, theirs: &CertificateOfMembership) -> bool {
+    if ours.qualifiers.is_empty() || theirs.qualifiers.is_empty() {
+        return false;
+    }
     for our_q in &ours.qualifiers {
         match theirs.qualifiers.iter().find(|oq| oq.id == our_q.id) {
             None => return false,
@@ -592,14 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn agrees_with_empty_qualifiers() {
+    fn empty_qualifiers_agree_with_nothing() {
         let ours = make_com(vec![]);
         let theirs = make_com(vec![ComQualifier {
             id: 0,
             value: 999,
             max_delta: 0,
         }]);
-        assert!(com_agrees_with(&ours, &theirs));
+        assert!(!com_agrees_with(&ours, &theirs));
+        assert!(!com_agrees_with(&theirs, &ours));
     }
 
     #[test]
