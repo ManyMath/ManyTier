@@ -248,6 +248,9 @@ pub fn handle_multicast_like(
     }
 
     for network_id in network_ids {
+        if !may_share_multicast(node, network_id, sender_address) {
+            continue;
+        }
         let groups: Vec<_> = like
             .groups
             .iter()
@@ -274,6 +277,9 @@ pub fn handle_multicast_gather(
         Ok(g) => g,
         Err(_) => return,
     };
+    if !may_share_multicast(node, gather.network_id, sender_address) {
+        return;
+    }
 
     // Like ZeroTier One's Multicaster::gather: ourselves first if we are in
     // the group, then the members we know of, never the asker itself.
@@ -851,6 +857,18 @@ fn is_directed_broadcast_v4(
     })
 }
 
+/// Whether a peer's MULTICAST_LIKE is recorded and its MULTICAST_GATHER
+/// answered for a network: it holds a valid certificate for it, or we are a
+/// root or the network's controller (ZeroTierOne _doMULTICAST_LIKE,
+/// _doMULTICAST_GATHER). Anyone else could fill our subscription table or
+/// read a network's member list.
+fn may_share_multicast(node: &Node, network_id: u64, sender_address: &[u8; 5]) -> bool {
+    let our_address = node.identity.address.as_bytes();
+    has_peer_com(node, network_id, sender_address)
+        || node.topology.roots.contains(our_address)
+        || crate::node::controller_address_from_network_id(network_id) == *our_address
+}
+
 /// A COM sent inside a frame (flag 0x01, deprecated but still sent by
 /// older peers) is the sender's credential, as if it had arrived in
 /// NETWORK_CREDENTIALS (ZeroTierOne `network->addCredential(com)`). It is
@@ -1270,9 +1288,16 @@ mod tests {
     #[test]
     fn multicast_gather_ok_uses_upstream_layout() {
         let network_id = 0xfe00000000abcdef_u64;
-        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let (mut node, signing_key, controller) = make_node_with_com(network_id);
         let sender = test_identity(0x33);
         let sender_addr = *sender.address.as_bytes();
+        add_peer_com(
+            &mut node,
+            network_id,
+            &signing_key,
+            &controller,
+            &sender_addr,
+        );
         let from: SocketAddr = "203.0.113.30:9993".parse().unwrap();
         let shared_secret = [0x66; 48];
         node.topology.add_peer(sender);
@@ -1820,5 +1845,37 @@ mod tests {
             .drain_actions()
             .iter()
             .any(|a| matches!(a, NodeAction::FrameReceived { .. })));
+    }
+
+    /// A MULTICAST_LIKE from a peer without a certificate for the network is
+    /// not recorded (ZeroTierOne _doMULTICAST_LIKE gates on membership).
+    #[test]
+    fn multicast_like_from_a_non_member_is_ignored() {
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, signing_key, controller) = make_node_with_com(network_id);
+        let like = MulticastLikePayload {
+            groups: vec![zerotier_protocol::verbs::multicast::MulticastGroup {
+                network_id,
+                mac: [0xff; 6],
+                adi: 0,
+            }],
+        };
+        let mut buf = [0u8; 64];
+        let n = like.serialize(&mut buf);
+        let stranger = [0x0c; 5];
+        handle_multicast_like(&mut node, &stranger, &buf[..n], 1000);
+        assert!(node
+            .multicast_manager
+            .get_subscribers(network_id, &[0xff; 6], 0, 10)
+            .is_empty());
+
+        let member = [0x0d; 5];
+        add_peer_com(&mut node, network_id, &signing_key, &controller, &member);
+        handle_multicast_like(&mut node, &member, &buf[..n], 1000);
+        assert_eq!(
+            node.multicast_manager
+                .get_subscribers(network_id, &[0xff; 6], 0, 10),
+            vec![member]
+        );
     }
 }

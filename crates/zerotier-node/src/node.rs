@@ -3852,6 +3852,37 @@ mod tests {
         peer_address
     }
 
+    /// Give `node` controller-signed COMs for itself and for `peers` on
+    /// `network_id`, and the controller's identity so they verify.
+    fn certify(node: &mut Node, network_id: u64, peers: &[[u8; 5]]) {
+        use crate::controller::engine::{build_signed_com, zt_address_to_u64};
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let controller = controller_address_from_network_id(network_id);
+        let mut public_key = [0u8; 64];
+        public_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        node.topology.add_peer(Identity {
+            address: Address::new(controller).unwrap(),
+            public_key: PublicKey::from_bytes(&public_key).unwrap(),
+            secret: None,
+        });
+        let com_for = |address: &[u8; 5]| {
+            build_signed_com(
+                &signing_key,
+                &controller,
+                network_id,
+                zt_address_to_u64(address),
+                1000,
+            )
+        };
+        let our_address = *node.identity.address.as_bytes();
+        let net = node.find_network_mut(network_id).unwrap();
+        net.our_com = Some(com_for(&our_address));
+        for peer in peers {
+            net.peer_coms.push((*peer, com_for(peer)));
+        }
+    }
+
     fn make_membership_with_peer(
         network_id: u64,
         our_address: [u8; 5],
@@ -5196,7 +5227,7 @@ mod tests {
             shared_secret,
         );
 
-        let network_id = 0xff00000000abcdef;
+        let network_id = 0xfe00000000abcdef;
         node_a.join_network(make_membership_with_peer(
             network_id,
             node_a_address,
@@ -5207,6 +5238,8 @@ mod tests {
             node_b_address,
             node_a_address,
         ));
+        certify(&mut node_a, network_id, &[node_b_address]);
+        certify(&mut node_b, network_id, &[node_a_address]);
 
         let outbound = node_a.tick(45_000);
         let mut responses = Vec::new();
