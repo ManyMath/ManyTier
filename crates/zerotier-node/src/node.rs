@@ -4110,16 +4110,28 @@ mod tests {
     }
 
     #[test]
-    fn tick_returns_empty_initially() {
+    fn tick_hellos_the_root_at_startup() {
         let id = test_identity(0x01);
         let planet = make_synthetic_planet();
         let mut node = Node::new(id, &planet, 1).unwrap();
-        // No peers have sessions, so no pings needed
+        let root_paths: Vec<SocketAddr> = node
+            .topology
+            .roots
+            .iter()
+            .filter_map(|root| node.topology.get_peer(root))
+            .flat_map(|peer| peer.paths.iter().map(|path| path.address))
+            .collect();
+
+        // No session with the root yet: the first tick says HELLO to it.
         let actions = node.tick(1000);
-        // Root is in Unknown state -> tick will try to reconnect to root
-        // so actions may not be empty (root reconnect)
-        // This is correct behavior
-        let _ = actions;
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                NodeAction::SendTo { data, address }
+                    if root_paths.contains(address) && data[27] & 0x1f == Verb::Hello.to_byte()
+            )),
+            "expected a HELLO to the root, got {actions:?}"
+        );
     }
 
     #[test]
@@ -5153,8 +5165,18 @@ mod tests {
         let planet = make_synthetic_planet();
         let mut node = Node::new(id, &planet, 1).unwrap();
 
-        // Tick should call evict_stale on reassembly buffer without panic
-        let _ = node.tick(100_000);
+        // A fragment whose head never arrives is dropped by the next tick
+        // after ZT_PATH_HEARTBEAT_PERIOD, so a late head cannot complete it.
+        assert!(node.reassembly.insert(7, 1, 2, vec![0xaa], 1_000).is_none());
+        node.tick(1_000 + ZT_PATH_HEARTBEAT_PERIOD);
+        assert!(node
+            .reassembly
+            .insert_head(7, vec![0xbb], 1_000 + ZT_PATH_HEARTBEAT_PERIOD)
+            .is_none());
+
+        // Without the eviction the same pair completes.
+        assert!(node.reassembly.insert(8, 1, 2, vec![0xaa], 1_000).is_none());
+        assert!(node.reassembly.insert_head(8, vec![0xbb], 1_000).is_some());
     }
 
     #[test]

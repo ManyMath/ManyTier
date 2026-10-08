@@ -1126,7 +1126,6 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = ext.serialize(&mut buf);
 
-        // Test the has_peer_com helper and parsing logic directly.
         let (mut node, signing_key, controller_address) = make_node_with_com(network_id);
         add_peer_com(
             &mut node,
@@ -1136,13 +1135,17 @@ mod tests {
             &sender,
         );
 
-        // Verify COM check works
-        assert!(has_peer_com(&node, network_id, &sender));
-
-        // Verify parsing works
-        let parsed = ExtFramePayload::parse(&buf[..n]).unwrap();
-        assert_eq!(parsed.network_id, network_id);
-        assert_eq!(parsed.payload, &[0xDE, 0xAD]);
+        let from: SocketAddr = "10.0.0.60:9993".parse().unwrap();
+        handle_ext_frame(&mut node, &sender, &buf[..n], from, 2000, 1);
+        let actions = node.drain_actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                NodeAction::FrameReceived { network_id: id, ethertype: 0x0800, payload, .. }
+                    if *id == network_id && payload == &[0xDE, 0xAD]
+            )),
+            "got {actions:?}"
+        );
     }
 
     #[test]
