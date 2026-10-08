@@ -71,41 +71,25 @@ mod tests {
 
     #[test]
     fn message_format_matches_vendor() {
-        // Verify the 13-byte KBKDF message for K0 (label=b'0'=0x30)
-        let expected_k0_msg: [u8; 13] = [
-            0x00, 0x00, 0x00, 0x00, // iter = 0
-            0x5A, 0x54, // "ZT"
-            0x30, // label = b'0'
-            0x00, // separator
-            0x00, // context
-            0x00, 0x00, 0x01, 0x80, // 384 bits BE
+        // HMAC-SHA384(TEST_SECRET, msg) for ZeroTierOne's 13-byte KBKDF
+        // messages (SHA512.cpp KBKDFHMACSHA384): iter 0, "ZT", the label
+        // ('0' for K0, '1' for K1), 0x00, context 0x00, 384 as a u32. The
+        // expected keys were computed outside this crate with Python's hmac
+        // module, so a wrong message layout here cannot also produce them.
+        let expected_k0: [u8; 48] = [
+            0xb6, 0x7c, 0x95, 0x84, 0x30, 0x98, 0x8c, 0x70, 0xac, 0x71, 0x10, 0x22, 0x39, 0xdf,
+            0x57, 0x27, 0x45, 0xf7, 0x2f, 0x5d, 0x19, 0xa6, 0x47, 0xd2, 0x9e, 0x4a, 0x70, 0xa2,
+            0x02, 0x6c, 0xa5, 0xf7, 0x07, 0x77, 0x78, 0x01, 0xe3, 0xac, 0x13, 0xf5, 0xe7, 0x4c,
+            0x40, 0xe8, 0x9c, 0x70, 0x2c, 0x6d,
         ];
-
-        // Verify the 13-byte KBKDF message for K1 (label=b'1'=0x31)
-        let expected_k1_msg: [u8; 13] = [
-            0x00, 0x00, 0x00, 0x00, 0x5A, 0x54, 0x31, // label = b'1'
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x80,
+        let expected_k1: [u8; 48] = [
+            0x4c, 0xb6, 0x43, 0xdb, 0xb0, 0x79, 0x7b, 0x3d, 0xa3, 0x89, 0x63, 0x6d, 0x41, 0x72,
+            0x20, 0x22, 0x9d, 0x07, 0x65, 0x28, 0x8d, 0xd3, 0xb8, 0x0e, 0x1f, 0x93, 0x0b, 0x30,
+            0x10, 0xd5, 0x0e, 0x3e, 0x05, 0x38, 0x69, 0x53, 0xbe, 0x85, 0x3b, 0xb4, 0x45, 0xa5,
+            0x84, 0x08, 0x7e, 0x7f, 0x2f, 0xa5,
         ];
-
-        // Compute expected outputs using the raw HMAC to cross-check
-        let mut mac0 = HmacSha384::new_from_slice(&TEST_SECRET).unwrap();
-        mac0.update(&expected_k0_msg);
-        let expected_k0: [u8; 48] = mac0.finalize().into_bytes().into();
-
-        let mut mac1 = HmacSha384::new_from_slice(&TEST_SECRET).unwrap();
-        mac1.update(&expected_k1_msg);
-        let expected_k1: [u8; 48] = mac1.finalize().into_bytes().into();
-
-        assert_eq!(
-            derive_k0(&TEST_SECRET),
-            expected_k0,
-            "K0 output must match raw HMAC with vendor message format"
-        );
-        assert_eq!(
-            derive_k1(&TEST_SECRET),
-            expected_k1,
-            "K1 output must match raw HMAC with vendor message format"
-        );
+        assert_eq!(derive_k0(&TEST_SECRET), expected_k0);
+        assert_eq!(derive_k1(&TEST_SECRET), expected_k1);
     }
 
     #[test]

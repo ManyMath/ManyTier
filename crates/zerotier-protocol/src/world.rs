@@ -641,4 +641,20 @@ mod tests {
         let serialized_len = world.serialize(&mut serialized).unwrap();
         assert_eq!(n, serialized_len - 96 + 16);
     }
+
+    /// The official roots' addresses must come out of their public keys by
+    /// the memory-hard hash; this pins that hash (Salsa20 with 20 rounds,
+    /// the 2 MiB buffer walk, the PoW threshold) to real ZeroTier One
+    /// identities.
+    #[test]
+    fn default_planet_root_identities_validate() {
+        let world = World::deserialize(DEFAULT_PLANET).unwrap();
+        for root in &world.roots {
+            assert!(
+                root.identity.validate_address(),
+                "{:?}",
+                root.identity.address
+            );
+        }
+    }
 }

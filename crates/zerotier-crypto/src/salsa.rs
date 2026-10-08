@@ -503,23 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn uses_salsa12_not_salsa20() {
-        // This test verifies we're using Salsa12 by checking that the
-        // output differs from what Salsa20 would produce.
-        // The type system enforces this (we import Salsa12), but we verify
-        // the encryption output is deterministic and specific to Salsa12.
-        let secret = test_shared_secret();
-        let mut pkt1 = make_test_packet(1);
-        let mut pkt2 = make_test_packet(1);
-
-        armor_packet(&secret, &mut pkt1, true).unwrap();
-        armor_packet(&secret, &mut pkt2, true).unwrap();
-
-        // Same input -> same output (deterministic)
-        assert_eq!(&pkt1[..], &pkt2[..]);
-    }
-
-    #[test]
     fn nonce_is_8_bytes_from_packet_iv() {
         // Different IVs should produce different ciphertexts
         let secret = test_shared_secret();

@@ -142,19 +142,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_memory_hard_hash_uses_salsa20_not_salsa12() {
-        // This test verifies that the function uses Salsa20 (20 rounds)
-        // by checking the module-level import. The type system enforces
-        // correctness: Salsa20 != Salsa12.
-        // The function signature uses salsa20::Salsa20 explicitly.
-        let pub_key = [0x42u8; 64];
-        let digest = compute_memory_hard_hash(&pub_key);
-        // Just verify it runs and produces output -- the type system
-        // guarantees Salsa20 (20 rounds) is used, not Salsa12.
-        assert_eq!(digest.len(), 64);
-    }
-
-    #[test]
     fn derive_address_rejects_high_first_byte() {
         let mut digest = [0u8; 64];
         digest[0] = 17; // exactly at threshold
