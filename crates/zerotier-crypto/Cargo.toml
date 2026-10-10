@@ -13,8 +13,8 @@ description = "Cryptographic primitives for the ZeroTier protocol"
 
 [features]
 default = []
-# Placeholder for V2 (P-384/Kyber/ZSSP) crypto primitives. Empty until V2 is scoped with the
-# user -- see crates/zerotier-crypto/src/v2.rs and PROJECT.md's "V1/V2 boundary" section.
+# Placeholder for V2 (P-384/Kyber/ZSSP) crypto primitives. Empty until V2 is scoped; see
+# src/v2.rs for the V1/V2 boundary.
 v2 = []
 
 [dependencies]

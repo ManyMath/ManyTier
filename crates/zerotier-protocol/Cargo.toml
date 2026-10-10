@@ -13,8 +13,8 @@ description = "ZeroTier V1 wire format types and protocol definitions"
 
 [features]
 default = []
-# Placeholder for V2 wire format types (negotiation, new verbs). Empty until V2 is scoped with
-# the user -- see crates/zerotier-protocol/src/v2.rs and PROJECT.md's "V1/V2 boundary" section.
+# Placeholder for V2 wire format types (negotiation, new verbs). Empty until V2 is
+# scoped; see src/v2.rs for the V1/V2 boundary.
 v2 = ["zerotier-crypto/v2"]
 
 [dependencies]

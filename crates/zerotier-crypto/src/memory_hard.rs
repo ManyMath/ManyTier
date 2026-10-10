@@ -7,7 +7,8 @@
 /// continuing the same Salsa20 stream.
 ///
 /// IMPORTANT: This uses Salsa20 (20 rounds), NOT Salsa20/12. The 12-round
-/// variant is used for packet encryption only (per Pitfall 4 in RESEARCH.md).
+/// variant is used for packet encryption only (ZeroTierOne node/Identity.cpp
+/// `_computeMemoryHardHash` vs. node/Packet.cpp `armor`).
 extern crate alloc;
 use alloc::vec;
 
