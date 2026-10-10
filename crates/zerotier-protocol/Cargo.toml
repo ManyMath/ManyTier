@@ -20,8 +20,6 @@ v2 = ["zerotier-crypto/v2"]
 [dependencies]
 zerotier-crypto = { workspace = true }
 zerocopy = { workspace = true }
-thiserror = { workspace = true }
-hashbrown = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

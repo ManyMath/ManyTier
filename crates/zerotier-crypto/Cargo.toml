@@ -22,10 +22,8 @@ salsa20 = { workspace = true }
 poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
-curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
-thiserror = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 cipher = { workspace = true }
