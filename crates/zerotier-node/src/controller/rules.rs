@@ -1,7 +1,8 @@
 //! ZeroTier network rules engine.
 //!
-//! Provides types and serialization for match/action rules, tags, and capabilities
-//! that are included in NetworkConfig dictionaries (R, TAG, CAP keys).
+//! Provides types, serialization and parsing for match/action rules, tags, and
+//! capabilities that are included in NetworkConfig dictionaries (R, TAG, CAP
+//! keys) and NETWORK_CREDENTIALS. Evaluation lives in [`crate::filter`].
 //!
 //! Binary format per rule entry:
 //! - `u8 type_and_flags`: bits 0-5 = rule type, bit 6 = OR flag, bit 7 = NOT flag
@@ -548,17 +549,7 @@ pub fn serialize_tags_signed(
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(tags.len() * 135);
     for tag in tags {
-        let mut signed_data = Vec::with_capacity(48);
-        signed_data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
-        signed_data.extend_from_slice(&network_id.to_be_bytes());
-        signed_data.extend_from_slice(&timestamp.to_be_bytes());
-        signed_data.extend_from_slice(&tag.id.to_be_bytes());
-        signed_data.extend_from_slice(&tag.value.to_be_bytes());
-        signed_data.extend_from_slice(issued_to);
-        signed_data.extend_from_slice(signed_by);
-        signed_data.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
-        signed_data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
-
+        let signed_data = tag_signed_data(network_id, timestamp, tag, issued_to, signed_by);
         let signature = zerotier_crypto::signing::sign(signing_key, &signed_data);
 
         buf.extend_from_slice(&network_id.to_be_bytes());
@@ -599,17 +590,7 @@ pub fn serialize_capabilities_signed(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     for cap in caps {
-        let mut signed_data = Vec::new();
-        signed_data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
-        signed_data.extend_from_slice(&network_id.to_be_bytes());
-        signed_data.extend_from_slice(&timestamp.to_be_bytes());
-        signed_data.extend_from_slice(&cap.id.to_be_bytes());
-        signed_data.extend_from_slice(&(cap.rules.len() as u16).to_be_bytes());
-        signed_data.extend_from_slice(&serialize_rules(&cap.rules));
-        signed_data.push(1); // max_custody_chain_length
-        signed_data.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
-        signed_data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
-
+        let signed_data = capability_signed_data(network_id, timestamp, cap, 1);
         let signature = zerotier_crypto::signing::sign(signing_key, &signed_data);
 
         buf.extend_from_slice(&network_id.to_be_bytes());
@@ -627,6 +608,449 @@ pub fn serialize_capabilities_signed(
         buf.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
     }
     buf
+}
+
+/// What upstream `Tag::sign`/`Tag::verify` sign: `Tag::serialize(b, true)`.
+fn tag_signed_data(
+    network_id: u64,
+    timestamp: u64,
+    tag: &Tag,
+    issued_to: &[u8; 5],
+    signed_by: &[u8; 5],
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(52);
+    data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
+    data.extend_from_slice(&network_id.to_be_bytes());
+    data.extend_from_slice(&timestamp.to_be_bytes());
+    data.extend_from_slice(&tag.id.to_be_bytes());
+    data.extend_from_slice(&tag.value.to_be_bytes());
+    data.extend_from_slice(issued_to);
+    data.extend_from_slice(signed_by);
+    data.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
+    data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
+    data
+}
+
+/// What upstream `Capability::sign`/`Capability::verify` sign:
+/// `Capability::serialize(b, true)`, which leaves out the custody chain.
+fn capability_signed_data(
+    network_id: u64,
+    timestamp: u64,
+    cap: &Capability,
+    max_custody_chain_length: u8,
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
+    data.extend_from_slice(&network_id.to_be_bytes());
+    data.extend_from_slice(&timestamp.to_be_bytes());
+    data.extend_from_slice(&cap.id.to_be_bytes());
+    data.extend_from_slice(&(cap.rules.len() as u16).to_be_bytes());
+    data.extend_from_slice(&serialize_rules(&cap.rules));
+    data.push(max_custody_chain_length);
+    data.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
+    data.extend_from_slice(&SIGN_MARKER.to_be_bytes());
+    data
+}
+
+/// Upstream `Network::controllerFor`: the top 40 bits of the network ID.
+fn controller_for(network_id: u64) -> [u8; 5] {
+    let b = network_id.to_be_bytes();
+    [b[0], b[1], b[2], b[3], b[4]]
+}
+
+// ---------------------------------------------------------------------------
+// Deserialization
+// ---------------------------------------------------------------------------
+
+// Limits from upstream include/ZeroTierOne.h.
+pub const MAX_NETWORK_RULES: usize = 1024;
+pub const MAX_NETWORK_CAPABILITIES: usize = 128;
+pub const MAX_NETWORK_TAGS: usize = 128;
+pub const MAX_CAPABILITY_RULES: usize = 64;
+pub const MAX_CAPABILITY_CUSTODY_CHAIN_LENGTH: u8 = 7;
+
+/// Why a rule chain, tag or capability failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleParseError {
+    /// The data ended inside an object.
+    Truncated,
+    /// A capability declared more than [`MAX_CAPABILITY_RULES`] rules.
+    TooManyRules,
+    /// A capability's custody chain length was out of range or exceeded.
+    InvalidCustodyChain,
+    /// An Ed25519 signature was not 96 bytes long.
+    InvalidSignatureLength,
+}
+
+impl core::fmt::Display for RuleParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "data ended inside a rule or credential"),
+            Self::TooManyRules => write!(f, "capability has too many rules"),
+            Self::InvalidCustodyChain => write!(f, "invalid capability custody chain"),
+            Self::InvalidSignatureLength => write!(f, "invalid signature length"),
+        }
+    }
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Reader { buf, pos: 0 }
+    }
+
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], RuleParseError> {
+        let out = self
+            .buf
+            .get(self.pos..self.pos + n)
+            .ok_or(RuleParseError::Truncated)?;
+        self.pos += n;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, RuleParseError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, RuleParseError> {
+        let b = self.bytes(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, RuleParseError> {
+        let b = self.bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, RuleParseError> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.bytes(8)?);
+        Ok(u64::from_be_bytes(b))
+    }
+
+    fn address(&mut self) -> Result<[u8; 5], RuleParseError> {
+        let mut a = [0u8; 5];
+        a.copy_from_slice(self.bytes(5)?);
+        Ok(a)
+    }
+
+    /// `[u8 type][u16 len][len bytes]`. Upstream keeps only type 1
+    /// (Ed25519, which must be 96 bytes); anything else stays all zero.
+    fn signature(&mut self) -> Result<[u8; SIGNATURE_LEN], RuleParseError> {
+        let mut sig = [0u8; SIGNATURE_LEN];
+        if self.u8()? == SIGNATURE_TYPE_ED25519 {
+            if self.u16()? as usize != SIGNATURE_LEN {
+                return Err(RuleParseError::InvalidSignatureLength);
+            }
+            sig.copy_from_slice(self.bytes(SIGNATURE_LEN)?);
+        } else {
+            let len = self.u16()? as usize;
+            self.bytes(len)?;
+        }
+        Ok(sig)
+    }
+
+    fn skip_additional_fields(&mut self) -> Result<(), RuleParseError> {
+        let len = self.u16()? as usize;
+        self.bytes(len).map(|_| ())
+    }
+}
+
+/// Bytes upstream `Capability::deserializeRules` reads for a rule type's
+/// value, whatever the encoded field length says. Zero for types it
+/// ignores, including `ACTION_PRIORITY`, whose bucket it never parses.
+fn rule_value_len(rule_type: u8) -> usize {
+    match rule_type & 0x3F {
+        ACTION_TEE | ACTION_WATCH | ACTION_REDIRECT => 14,
+        MATCH_SOURCE_ZEROTIER_ADDRESS | MATCH_DEST_ZEROTIER_ADDRESS => 5,
+        MATCH_VLAN_PCP | MATCH_VLAN_DEI | MATCH_IP_PROTOCOL => 1,
+        MATCH_VLAN_ID | MATCH_ETHERTYPE => 2,
+        MATCH_IP_TOS | MATCH_ICMP => 3,
+        MATCH_IP_SOURCE_PORT_RANGE
+        | MATCH_IP_DEST_PORT_RANGE
+        | MATCH_FRAME_SIZE_RANGE
+        | MATCH_RANDOM => 4,
+        MATCH_IPV4_SOURCE | MATCH_IPV4_DEST => 5,
+        MATCH_MAC_SOURCE | MATCH_MAC_DEST => 6,
+        MATCH_CHARACTERISTICS
+        | MATCH_TAGS_DIFFERENCE
+        | MATCH_TAGS_BITWISE_AND
+        | MATCH_TAGS_BITWISE_OR
+        | MATCH_TAGS_BITWISE_XOR
+        | MATCH_TAGS_EQUAL
+        | MATCH_TAG_SENDER
+        | MATCH_TAG_RECEIVER => 8,
+        MATCH_IPV6_SOURCE | MATCH_IPV6_DEST => 17,
+        MATCH_INTEGER_RANGE => 19,
+        _ => 0,
+    }
+}
+
+/// Port of upstream `Capability::deserializeRules`: up to `max` rules,
+/// stopping at the end of the buffer. Values are stored the way upstream
+/// holds them in memory, so [`serialize_rules`] reproduces upstream
+/// `serializeRules` output -- the bytes capability signatures cover.
+fn read_rules(r: &mut Reader<'_>, max: usize) -> Result<Vec<Rule>, RuleParseError> {
+    let mut rules = Vec::new();
+    while rules.len() < max && r.pos < r.buf.len() {
+        let t = r.u8()?;
+        let field_len = r.u8()? as usize;
+        let start = r.pos;
+        // Upstream reads each type's fixed layout from the field start even
+        // when the declared length is shorter, then skips the declared length.
+        let mut value = r.bytes(rule_value_len(t))?.to_vec();
+        if t & 0x3F == MATCH_INTEGER_RANGE {
+            // Upstream keeps `end` as a u32 delta from `start`.
+            let mut s = [0u8; 8];
+            let mut e = [0u8; 8];
+            s.copy_from_slice(&value[0..8]);
+            e.copy_from_slice(&value[8..16]);
+            let (s, e) = (u64::from_be_bytes(s), u64::from_be_bytes(e));
+            let end = s.wrapping_add(e.wrapping_sub(s) as u32 as u64);
+            value[8..16].copy_from_slice(&end.to_be_bytes());
+        }
+        r.pos = start + field_len;
+        rules.push(Rule {
+            rule_type: t & 0x3F,
+            not_flag: t & 0x80 != 0,
+            or_flag: t & 0x40 != 0,
+            value,
+        });
+    }
+    Ok(rules)
+}
+
+/// Parse a network config's `R` value (upstream
+/// `NetworkConfig::fromDictionary`, at most [`MAX_NETWORK_RULES`]).
+pub fn deserialize_rules(data: &[u8]) -> Result<Vec<Rule>, RuleParseError> {
+    read_rules(&mut Reader::new(data), MAX_NETWORK_RULES)
+}
+
+/// A signed tag as carried in the `TAG` config key and in
+/// NETWORK_CREDENTIALS (upstream `Tag`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCredential {
+    pub network_id: u64,
+    pub timestamp: u64,
+    pub tag: Tag,
+    pub issued_to: [u8; 5],
+    pub signed_by: [u8; 5],
+    /// All zero unless the signature type was Ed25519.
+    pub signature: [u8; SIGNATURE_LEN],
+}
+
+impl TagCredential {
+    /// Port of upstream `Tag::deserialize`; returns the tag and the number
+    /// of bytes it took.
+    pub fn deserialize(data: &[u8]) -> Result<(Self, usize), RuleParseError> {
+        let mut r = Reader::new(data);
+        let network_id = r.u64()?;
+        let timestamp = r.u64()?;
+        let id = r.u32()?;
+        let value = r.u32()?;
+        let issued_to = r.address()?;
+        let signed_by = r.address()?;
+        let signature = r.signature()?;
+        r.skip_additional_fields()?;
+        let tag = TagCredential {
+            network_id,
+            timestamp,
+            tag: Tag { id, value },
+            issued_to,
+            signed_by,
+            signature,
+        };
+        Ok((tag, r.pos))
+    }
+
+    /// Port of upstream `Tag::verify` given the controller's key: the tag
+    /// must be signed by its network's controller.
+    pub fn verify(&self, controller_key: &ed25519_dalek::VerifyingKey) -> bool {
+        if self.signed_by == [0u8; 5] || self.signed_by != controller_for(self.network_id) {
+            return false;
+        }
+        let data = tag_signed_data(
+            self.network_id,
+            self.timestamp,
+            &self.tag,
+            &self.issued_to,
+            &self.signed_by,
+        );
+        zerotier_crypto::signing::verify(controller_key, &data, &self.signature).is_ok()
+    }
+}
+
+/// One link in a capability's chain of custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyLink {
+    pub to: [u8; 5],
+    pub from: [u8; 5],
+    /// All zero unless the signature type was Ed25519.
+    pub signature: [u8; SIGNATURE_LEN],
+}
+
+/// A signed capability as carried in the `CAP` config key and in
+/// NETWORK_CREDENTIALS (upstream `Capability`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityCredential {
+    pub network_id: u64,
+    pub timestamp: u64,
+    pub capability: Capability,
+    pub max_custody_chain_length: u8,
+    pub custody: Vec<CustodyLink>,
+}
+
+impl CapabilityCredential {
+    /// Port of upstream `Capability::deserialize`; returns the capability
+    /// and the number of bytes it took.
+    pub fn deserialize(data: &[u8]) -> Result<(Self, usize), RuleParseError> {
+        let mut r = Reader::new(data);
+        let network_id = r.u64()?;
+        let timestamp = r.u64()?;
+        let id = r.u32()?;
+        let rule_count = r.u16()? as usize;
+        if rule_count > MAX_CAPABILITY_RULES {
+            return Err(RuleParseError::TooManyRules);
+        }
+        let rules = read_rules(&mut r, rule_count)?;
+        let max_custody_chain_length = r.u8()?;
+        if !(1..=MAX_CAPABILITY_CUSTODY_CHAIN_LENGTH).contains(&max_custody_chain_length) {
+            return Err(RuleParseError::InvalidCustodyChain);
+        }
+        let mut custody = Vec::new();
+        loop {
+            let to = r.address()?;
+            if to == [0u8; 5] {
+                break;
+            }
+            if custody.len() >= max_custody_chain_length as usize {
+                return Err(RuleParseError::InvalidCustodyChain);
+            }
+            let from = r.address()?;
+            let signature = r.signature()?;
+            custody.push(CustodyLink {
+                to,
+                from,
+                signature,
+            });
+        }
+        r.skip_additional_fields()?;
+        let cap = CapabilityCredential {
+            network_id,
+            timestamp,
+            capability: Capability { id, rules },
+            max_custody_chain_length,
+            custody,
+        };
+        Ok((cap, r.pos))
+    }
+
+    /// The last holder in the chain of custody (upstream
+    /// `Capability::issuedTo`), all zero if there is none.
+    pub fn issued_to(&self) -> [u8; 5] {
+        self.custody.last().map(|link| link.to).unwrap_or_default()
+    }
+
+    /// Port of upstream `Capability::verify` given the controller's key.
+    /// Upstream checks later custody links against each holder's identity;
+    /// controllers only issue single-link capabilities, so a link signed by
+    /// anyone but the controller is rejected here.
+    pub fn verify(&self, controller_key: &ed25519_dalek::VerifyingKey) -> bool {
+        let mccl = self.max_custody_chain_length;
+        if !(1..=MAX_CAPABILITY_CUSTODY_CHAIN_LENGTH).contains(&mccl) {
+            return false;
+        }
+        let controller = controller_for(self.network_id);
+        let data = capability_signed_data(self.network_id, self.timestamp, &self.capability, mccl);
+        for c in 0..mccl as usize {
+            let link = match self.custody.get(c) {
+                Some(link) if link.to != [0u8; 5] => link,
+                // The first link must exist; the chain may end after it.
+                _ => return c > 0,
+            };
+            let expected_from = if c == 0 {
+                controller
+            } else {
+                self.custody[c - 1].to
+            };
+            if link.from == [0u8; 5] || link.from != expected_from || link.from != controller {
+                return false;
+            }
+            if zerotier_crypto::signing::verify(controller_key, &data, &link.signature).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Parse a config's `CAP` value the way upstream
+/// `NetworkConfig::fromDictionary` does: capabilities before a malformed
+/// one are kept, and the result is sorted by ID (evaluation order).
+pub fn deserialize_capabilities(data: &[u8]) -> Vec<CapabilityCredential> {
+    let mut caps = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() && caps.len() < MAX_NETWORK_CAPABILITIES {
+        match CapabilityCredential::deserialize(&data[pos..]) {
+            Ok((cap, used)) => {
+                pos += used;
+                caps.push(cap);
+            }
+            Err(_) => break,
+        }
+    }
+    caps.sort_by_key(|cap| cap.capability.id);
+    caps
+}
+
+/// Parse a config's `TAG` value; same rules as [`deserialize_capabilities`].
+pub fn deserialize_tags(data: &[u8]) -> Vec<TagCredential> {
+    let mut tags = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() && tags.len() < MAX_NETWORK_TAGS {
+        match TagCredential::deserialize(&data[pos..]) {
+            Ok((tag, used)) => {
+                pos += used;
+                tags.push(tag);
+            }
+            Err(_) => break,
+        }
+    }
+    tags.sort_by_key(|tag| tag.tag.id);
+    tags
+}
+
+/// Read the capability and tag sections of a NETWORK_CREDENTIALS payload
+/// (`NetworkCredentialsPayload::sections`) as upstream
+/// `IncomingPacket::_doNETWORK_CREDENTIALS` does. The revocation and
+/// certificate-of-ownership sections after them are not parsed.
+pub fn deserialize_credential_sections(
+    sections: &[u8],
+) -> Result<(Vec<CapabilityCredential>, Vec<TagCredential>), RuleParseError> {
+    let mut caps = Vec::new();
+    let mut tags = Vec::new();
+    if sections.is_empty() {
+        return Ok((caps, tags));
+    }
+    let mut r = Reader::new(sections);
+    for _ in 0..r.u16()? {
+        let (cap, used) = CapabilityCredential::deserialize(&sections[r.pos..])?;
+        r.pos += used;
+        caps.push(cap);
+    }
+    if r.pos >= sections.len() {
+        return Ok((caps, tags));
+    }
+    for _ in 0..r.u16()? {
+        let (tag, used) = TagCredential::deserialize(&sections[r.pos..])?;
+        r.pos += used;
+        tags.push(tag);
+    }
+    Ok((caps, tags))
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,5 +1490,386 @@ mod tests {
             &signature
         )
         .is_ok());
+    }
+
+    // Upstream only accepts credentials signed by Network::controllerFor(nwid).
+    const NWID: u64 = 0x1122_3344_5500_0001;
+    const CONTROLLER: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
+    const MEMBER: [u8; 5] = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4];
+
+    fn rule(rule_type: u8, fields: Option<RuleFields>) -> Rule {
+        Rule {
+            rule_type,
+            not_flag: false,
+            or_flag: false,
+            value: fields.map(|f| encode_rule_fields(&f)).unwrap_or_default(),
+        }
+    }
+
+    fn one_rule_of_each_type() -> Vec<Rule> {
+        let mut rules = vec![
+            rule(
+                ACTION_TEE,
+                Some(RuleFields::Forward {
+                    address: 0x0102030405,
+                    flags: 0,
+                    length: 64,
+                }),
+            ),
+            rule(MATCH_DEST_ZEROTIER_ADDRESS, Some(RuleFields::ZtAddress(7))),
+            rule(MATCH_VLAN_ID, Some(RuleFields::VlanId(5))),
+            rule(MATCH_VLAN_PCP, Some(RuleFields::VlanPcp(1))),
+            rule(MATCH_MAC_DEST, Some(RuleFields::Mac([2; 6]))),
+            rule(
+                MATCH_IPV4_SOURCE,
+                Some(RuleFields::Ipv4 {
+                    ip: [10, 0, 0, 0],
+                    mask: 8,
+                }),
+            ),
+            rule(
+                MATCH_IPV6_DEST,
+                Some(RuleFields::Ipv6 {
+                    ip: [0xfd; 16],
+                    mask: 48,
+                }),
+            ),
+            rule(
+                MATCH_IP_TOS,
+                Some(RuleFields::IpTos {
+                    mask: 0xfc,
+                    start: 8,
+                    end: 16,
+                }),
+            ),
+            rule(MATCH_IP_PROTOCOL, Some(RuleFields::IpProtocol(6))),
+            rule(MATCH_ETHERTYPE, Some(RuleFields::EtherType(0x0800))),
+            rule(
+                MATCH_ICMP,
+                Some(RuleFields::Icmp {
+                    icmp_type: 8,
+                    icmp_code: Some(0),
+                }),
+            ),
+            rule(
+                MATCH_IP_DEST_PORT_RANGE,
+                Some(RuleFields::PortRange { start: 22, end: 22 }),
+            ),
+            rule(MATCH_CHARACTERISTICS, Some(RuleFields::Characteristics(2))),
+            rule(
+                MATCH_FRAME_SIZE_RANGE,
+                Some(RuleFields::FrameSizeRange { start: 0, end: 900 }),
+            ),
+            rule(MATCH_RANDOM, Some(RuleFields::RandomProbability(1 << 31))),
+            rule(MATCH_TAGS_EQUAL, Some(RuleFields::Tag { id: 1, value: 2 })),
+            rule(
+                MATCH_INTEGER_RANGE,
+                Some(RuleFields::IntegerRange {
+                    start: 1,
+                    end: 9,
+                    idx: 3,
+                    little: false,
+                    bits: 16,
+                }),
+            ),
+            rule(ACTION_BREAK, None),
+            rule(ACTION_DROP, None),
+            rule(ACTION_ACCEPT, None),
+        ];
+        rules[2].not_flag = true;
+        rules[3].or_flag = true;
+        rules[4].not_flag = true;
+        rules[4].or_flag = true;
+        rules
+    }
+
+    #[test]
+    fn deserialize_rules_round_trips_every_type_and_flag() {
+        let rules = one_rule_of_each_type();
+        assert_eq!(deserialize_rules(&serialize_rules(&rules)), Ok(rules));
+        assert_eq!(deserialize_rules(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn deserialize_rules_drops_priority_bucket_like_upstream() {
+        // Capability.hpp deserializeRules has no ACTION_PRIORITY case and
+        // serializeRules writes it with length 0.
+        let rules = deserialize_rules(&[ACTION_PRIORITY, 1, 3, ACTION_ACCEPT, 0]).unwrap();
+        assert_eq!(
+            rules,
+            vec![rule(ACTION_PRIORITY, None), rule(ACTION_ACCEPT, None)]
+        );
+        assert_eq!(
+            serialize_rules(&rules),
+            vec![ACTION_PRIORITY, 0, ACTION_ACCEPT, 0]
+        );
+    }
+
+    #[test]
+    fn deserialize_rules_skips_unknown_type_payload() {
+        let rules = deserialize_rules(&[0x3e, 3, 1, 2, 3, ACTION_DROP, 0]).unwrap();
+        assert_eq!(rules, vec![rule(0x3e, None), rule(ACTION_DROP, None)]);
+    }
+
+    #[test]
+    fn deserialize_rules_reads_fixed_layout_past_a_short_field_length() {
+        // Capability.hpp deserializeRules reads at<uint16_t>(p) for an
+        // ethertype and then advances by the declared length (1), so the
+        // ethertype's second byte is reread as the next rule's type.
+        let rules = deserialize_rules(&[MATCH_ETHERTYPE, 1, 0x08, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            rules,
+            vec![
+                rule(MATCH_ETHERTYPE, Some(RuleFields::EtherType(0x0800))),
+                rule(ACTION_DROP, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn deserialize_rules_keeps_integer_range_end_as_u32_delta() {
+        let mut value = Vec::new();
+        value.extend_from_slice(&10u64.to_be_bytes());
+        value.extend_from_slice(&(10u64 + (1 << 32) + 5).to_be_bytes());
+        value.extend_from_slice(&0u16.to_be_bytes());
+        value.push(7);
+        let mut wire = vec![MATCH_INTEGER_RANGE, 19];
+        wire.extend_from_slice(&value);
+        let rules = deserialize_rules(&wire).unwrap();
+        assert_eq!(
+            decode_rule_fields(rules[0].rule_type, &rules[0].value),
+            Some(RuleFields::IntegerRange {
+                start: 10,
+                end: 15,
+                idx: 0,
+                little: false,
+                bits: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn deserialize_rules_rejects_truncated_input() {
+        assert_eq!(
+            deserialize_rules(&[MATCH_ETHERTYPE]),
+            Err(RuleParseError::Truncated)
+        );
+        assert_eq!(
+            deserialize_rules(&[MATCH_ETHERTYPE, 2, 0x08]),
+            Err(RuleParseError::Truncated)
+        );
+        // Upstream only throws when a read crosses the end, not when the
+        // declared length does.
+        assert_eq!(
+            deserialize_rules(&[ACTION_ACCEPT, 9]),
+            Ok(vec![rule(ACTION_ACCEPT, None)])
+        );
+    }
+
+    fn signed_tag_bytes(tag: Tag, signed_by: &[u8; 5]) -> Vec<u8> {
+        serialize_tags_signed(&[tag], NWID, &MEMBER, signed_by, 5000, &test_signing_key())
+    }
+
+    fn signed_capability_bytes(cap: &Capability) -> Vec<u8> {
+        serialize_capabilities_signed(
+            core::slice::from_ref(cap),
+            NWID,
+            &MEMBER,
+            &CONTROLLER,
+            5000,
+            &test_signing_key(),
+        )
+    }
+
+    #[test]
+    fn tag_credential_parses_and_verifies_signed_tags() {
+        let key = test_signing_key().verifying_key();
+        let bytes = signed_tag_bytes(Tag { id: 3, value: 42 }, &CONTROLLER);
+        let (tag, used) = TagCredential::deserialize(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(tag.network_id, NWID);
+        assert_eq!(tag.timestamp, 5000);
+        assert_eq!(tag.tag, Tag { id: 3, value: 42 });
+        assert_eq!(tag.issued_to, MEMBER);
+        assert_eq!(tag.signed_by, CONTROLLER);
+        assert!(tag.verify(&key));
+
+        let mut tampered = tag.clone();
+        tampered.tag.value = 43;
+        assert!(!tampered.verify(&key));
+
+        let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]).verifying_key();
+        assert!(!tag.verify(&wrong_key));
+    }
+
+    #[test]
+    fn tag_credential_requires_the_network_controller_as_signer() {
+        // Tag.cpp verify: signedBy must equal Network::controllerFor(nwid).
+        let key = test_signing_key().verifying_key();
+        let bytes = signed_tag_bytes(Tag { id: 3, value: 42 }, &[9; 5]);
+        let (tag, _) = TagCredential::deserialize(&bytes).unwrap();
+        assert!(!tag.verify(&key));
+    }
+
+    #[test]
+    fn unsigned_tags_parse_but_do_not_verify() {
+        let bytes = serialize_tags(&[Tag { id: 1, value: 1 }], NWID, &MEMBER, 1);
+        let (tag, used) = TagCredential::deserialize(&bytes).unwrap();
+        assert_eq!(used, 135);
+        assert_eq!(tag.signature, [0u8; 96]);
+        assert!(!tag.verify(&test_signing_key().verifying_key()));
+    }
+
+    #[test]
+    fn tag_credential_rejects_bad_signature_length_and_truncation() {
+        let mut bytes = signed_tag_bytes(Tag { id: 3, value: 42 }, &CONTROLLER);
+        assert_eq!(
+            TagCredential::deserialize(&bytes[..134]),
+            Err(RuleParseError::Truncated)
+        );
+        bytes[36] = 95; // signature length low byte
+        assert_eq!(
+            TagCredential::deserialize(&bytes),
+            Err(RuleParseError::InvalidSignatureLength)
+        );
+    }
+
+    #[test]
+    fn capability_credential_parses_and_verifies_signed_capabilities() {
+        let key = test_signing_key().verifying_key();
+        let cap = Capability {
+            id: 77,
+            rules: one_rule_of_each_type(),
+        };
+        let bytes = signed_capability_bytes(&cap);
+        let (parsed, used) = CapabilityCredential::deserialize(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(parsed.network_id, NWID);
+        assert_eq!(parsed.timestamp, 5000);
+        assert_eq!(parsed.capability, cap);
+        assert_eq!(parsed.max_custody_chain_length, 1);
+        assert_eq!(parsed.custody.len(), 1);
+        assert_eq!(parsed.custody[0].from, CONTROLLER);
+        assert_eq!(parsed.issued_to(), MEMBER);
+        assert!(parsed.verify(&key));
+
+        let mut tampered = parsed.clone();
+        tampered.capability.rules.pop();
+        assert!(!tampered.verify(&key));
+
+        let mut forged = parsed.clone();
+        forged.custody[0].from = [9; 5];
+        assert!(!forged.verify(&key));
+    }
+
+    #[test]
+    fn unsigned_capabilities_parse_but_do_not_verify() {
+        let cap = Capability {
+            id: 1,
+            rules: default_allow_all(),
+        };
+        let bytes = serialize_capabilities(core::slice::from_ref(&cap), NWID, &MEMBER, 1);
+        let (parsed, used) = CapabilityCredential::deserialize(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(parsed.capability, cap);
+        assert!(parsed.custody.is_empty());
+        assert_eq!(parsed.issued_to(), [0u8; 5]);
+        assert!(!parsed.verify(&test_signing_key().verifying_key()));
+    }
+
+    #[test]
+    fn capability_credential_rejects_bad_headers() {
+        let cap = Capability {
+            id: 1,
+            rules: default_allow_all(),
+        };
+        let bytes = signed_capability_bytes(&cap);
+        // Byte 24 is max_custody_chain_length; upstream accepts 1..=7.
+        for bad in [0u8, 8] {
+            let mut b = bytes.clone();
+            b[24] = bad;
+            assert_eq!(
+                CapabilityCredential::deserialize(&b),
+                Err(RuleParseError::InvalidCustodyChain)
+            );
+        }
+        let mut too_many = bytes.clone();
+        too_many[20..22].copy_from_slice(&65u16.to_be_bytes());
+        assert_eq!(
+            CapabilityCredential::deserialize(&too_many),
+            Err(RuleParseError::TooManyRules)
+        );
+        // A second custody link with max_custody_chain_length 1.
+        let mut long_chain = bytes[..134].to_vec();
+        long_chain.extend_from_slice(&bytes[25..134]);
+        long_chain.extend_from_slice(&bytes[134..]);
+        assert_eq!(
+            CapabilityCredential::deserialize(&long_chain),
+            Err(RuleParseError::InvalidCustodyChain)
+        );
+        assert_eq!(
+            CapabilityCredential::deserialize(&bytes[..bytes.len() - 1]),
+            Err(RuleParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn deserialize_capabilities_keeps_the_valid_prefix_sorted_by_id() {
+        let mut data = signed_capability_bytes(&Capability {
+            id: 9,
+            rules: default_allow_all(),
+        });
+        data.extend_from_slice(&signed_capability_bytes(&Capability {
+            id: 3,
+            rules: vec![],
+        }));
+        data.extend_from_slice(&[0xff; 7]);
+        let ids: Vec<u32> = deserialize_capabilities(&data)
+            .iter()
+            .map(|cap| cap.capability.id)
+            .collect();
+        assert_eq!(ids, vec![3, 9]);
+    }
+
+    #[test]
+    fn deserialize_tags_keeps_the_valid_prefix_sorted_by_id() {
+        let mut data = signed_tag_bytes(Tag { id: 20, value: 1 }, &CONTROLLER);
+        data.extend_from_slice(&signed_tag_bytes(Tag { id: 10, value: 2 }, &CONTROLLER));
+        data.extend_from_slice(&[0x00; 30]);
+        let tags: Vec<Tag> = deserialize_tags(&data).into_iter().map(|t| t.tag).collect();
+        assert_eq!(
+            tags,
+            vec![Tag { id: 10, value: 2 }, Tag { id: 20, value: 1 }]
+        );
+    }
+
+    #[test]
+    fn credential_sections_round_trip_through_network_credentials_layout() {
+        use zerotier_protocol::verbs::network_config::NetworkCredentialsPayload;
+        let cap = Capability {
+            id: 4,
+            rules: default_allow_all(),
+        };
+        let cap_bytes = signed_capability_bytes(&cap);
+        let mut tag_bytes = signed_tag_bytes(Tag { id: 1, value: 2 }, &CONTROLLER);
+        tag_bytes.extend_from_slice(&signed_tag_bytes(Tag { id: 2, value: 3 }, &CONTROLLER));
+        let sections = NetworkCredentialsPayload::sections_from(1, &cap_bytes, 2, &tag_bytes);
+
+        let (caps, tags) = deserialize_credential_sections(&sections).unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].capability, cap);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[1].tag, Tag { id: 2, value: 3 });
+
+        // Older peers send no sections; a capability section alone is fine.
+        assert_eq!(deserialize_credential_sections(&[]), Ok((vec![], vec![])));
+        let mut caps_only = 1u16.to_be_bytes().to_vec();
+        caps_only.extend_from_slice(&cap_bytes);
+        let (caps, tags) = deserialize_credential_sections(&caps_only).unwrap();
+        assert_eq!((caps.len(), tags.len()), (1, 0));
+        assert_eq!(
+            deserialize_credential_sections(&sections[..sections.len() - 50]),
+            Err(RuleParseError::Truncated)
+        );
     }
 }
