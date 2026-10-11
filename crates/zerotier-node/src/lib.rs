@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod arp;
 pub mod controller;
 pub mod ethernet;
+pub mod filter;
 pub mod multicast;
 pub mod ndp;
 pub mod network;
