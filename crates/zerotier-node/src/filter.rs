@@ -968,3 +968,1464 @@ impl Eval<'_> {
         cf
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::rules::{
+        encode_rule_fields, serialize_capabilities_signed, serialize_rules, serialize_tags_signed,
+        Tag, ACTION_PRIORITY, MATCH_CHARACTERISTICS, MATCH_DEST_ZEROTIER_ADDRESS, MATCH_ETHERTYPE,
+        MATCH_FRAME_SIZE_RANGE, MATCH_ICMP, MATCH_INTEGER_RANGE, MATCH_IPV4_DEST, MATCH_IPV6_DEST,
+        MATCH_IP_PROTOCOL, MATCH_IP_SOURCE_PORT_RANGE, MATCH_IP_TOS, MATCH_MAC_DEST, MATCH_RANDOM,
+        MATCH_VLAN_DEI, MATCH_VLAN_ID, MATCH_VLAN_PCP,
+    };
+    use alloc::vec;
+    use core::cell::Cell;
+
+    const NWID: u64 = 0x1122_3344_5500_0001;
+    const CONTROLLER: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
+    const ME: [u8; 5] = [0x0a, 0, 0, 0, 1];
+    const PEER: [u8; 5] = [0x0b, 0, 0, 0, 2];
+    const OTHER: [u8; 5] = [0x0c, 0, 0, 0, 3];
+    const OTHER2: [u8; 5] = [0x0c, 0, 0, 0, 4];
+    const TS: u64 = 10_000;
+
+    const V4_SRC: [u8; 4] = [10, 1, 2, 3];
+    const V4_DST: [u8; 4] = [192, 168, 7, 9];
+    const V6_SRC: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const V6_DST: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    const ETHERTYPE_TEST: u16 = 0x88b5;
+
+    fn rule(rule_type: u8, fields: RuleFields) -> Rule {
+        Rule {
+            rule_type,
+            not_flag: false,
+            or_flag: false,
+            value: encode_rule_fields(&fields),
+        }
+    }
+
+    fn action(rule_type: u8) -> Rule {
+        Rule {
+            rule_type,
+            not_flag: false,
+            or_flag: false,
+            value: vec![],
+        }
+    }
+
+    fn not(mut r: Rule) -> Rule {
+        r.not_flag = true;
+        r
+    }
+
+    fn or(mut r: Rule) -> Rule {
+        r.or_flag = true;
+        r
+    }
+
+    fn accept() -> Rule {
+        action(ACTION_ACCEPT)
+    }
+
+    fn drop_rule() -> Rule {
+        action(ACTION_DROP)
+    }
+
+    fn ethertype(t: u16) -> Rule {
+        rule(MATCH_ETHERTYPE, RuleFields::EtherType(t))
+    }
+
+    fn forward(rule_type: u8, to: [u8; 5], length: u16) -> Rule {
+        let fields = RuleFields::Forward {
+            address: addr_u64(&to),
+            flags: 0,
+            length,
+        };
+        rule(rule_type, fields)
+    }
+
+    fn tag_rule(rule_type: u8, id: u32, value: u32) -> Rule {
+        rule(rule_type, RuleFields::Tag { id, value })
+    }
+
+    fn priority(value: &[u8]) -> Rule {
+        Rule {
+            value: value.to_vec(),
+            ..action(ACTION_PRIORITY)
+        }
+    }
+
+    fn dport(start: u16, end: u16) -> Rule {
+        rule(
+            MATCH_IP_DEST_PORT_RANGE,
+            RuleFields::PortRange { start, end },
+        )
+    }
+
+    fn sport(start: u16, end: u16) -> Rule {
+        rule(
+            MATCH_IP_SOURCE_PORT_RANGE,
+            RuleFields::PortRange { start, end },
+        )
+    }
+
+    fn peer_tags(tags: Vec<TagCredential>) -> PeerCredentials {
+        PeerCredentials {
+            tags,
+            ..Default::default()
+        }
+    }
+
+    fn peer_caps(capabilities: Vec<CapabilityCredential>) -> PeerCredentials {
+        PeerCredentials {
+            capabilities,
+            ..Default::default()
+        }
+    }
+
+    fn config(rules: Vec<Rule>) -> NetworkRules {
+        NetworkRules {
+            network_id: NWID,
+            timestamp: TS,
+            credential_time_max_delta: 1_000,
+            rules,
+            ..Default::default()
+        }
+    }
+
+    // The filter does not check signatures; PeerCredentials::add_* does.
+    fn tag(id: u32, value: u32, timestamp: u64) -> TagCredential {
+        TagCredential {
+            network_id: NWID,
+            timestamp,
+            tag: Tag { id, value },
+            issued_to: PEER,
+            signed_by: CONTROLLER,
+            signature: [0; 96],
+        }
+    }
+
+    fn cap(id: u32, rules: Vec<Rule>, timestamp: u64) -> CapabilityCredential {
+        CapabilityCredential {
+            network_id: NWID,
+            timestamp,
+            capability: Capability { id, rules },
+            max_custody_chain_length: 1,
+            custody: vec![],
+        }
+    }
+
+    fn mac(a: [u8; 5]) -> [u8; 6] {
+        crate::ethernet::derive_mac(&a, NWID)
+    }
+
+    fn ipv4(proto: u8, body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, proto, 0, 0];
+        p.extend_from_slice(&V4_SRC);
+        p.extend_from_slice(&V4_DST);
+        p.extend_from_slice(body);
+        p
+    }
+
+    fn ipv6(next: u8, body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, 0, 0, next, 64];
+        p.extend_from_slice(&V6_SRC);
+        p.extend_from_slice(&V6_DST);
+        p.extend_from_slice(body);
+        p
+    }
+
+    fn udp(src: u16, dst: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 8];
+        h[0..2].copy_from_slice(&src.to_be_bytes());
+        h[2..4].copy_from_slice(&dst.to_be_bytes());
+        h
+    }
+
+    fn tcp(src: u16, dst: u16, flags: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 20];
+        h[0..2].copy_from_slice(&src.to_be_bytes());
+        h[2..4].copy_from_slice(&dst.to_be_bytes());
+        h[12] = 0x50 | ((flags >> 8) as u8 & 0x0f);
+        h[13] = flags as u8;
+        h
+    }
+
+    /// An IPv6 extension header of `(units + 1) * 8` bytes.
+    fn ext(next: u8, units: u8) -> Vec<u8> {
+        let mut h = vec![0u8; (units as usize + 1) * 8];
+        h[0] = next;
+        h[1] = units;
+        h
+    }
+
+    /// Outbound, from us to PEER.
+    fn frame(ethertype: u16, payload: &[u8]) -> Frame<'_> {
+        Frame {
+            zt_source: ME,
+            zt_dest: Some(PEER),
+            mac_source: mac(ME),
+            mac_dest: mac(PEER),
+            ethertype,
+            vlan_id: 0,
+            payload,
+        }
+    }
+
+    /// Inbound, from PEER to us.
+    fn inbound(ethertype: u16, payload: &[u8]) -> Frame<'_> {
+        Frame {
+            zt_source: PEER,
+            zt_dest: Some(ME),
+            mac_source: mac(PEER),
+            mac_dest: mac(ME),
+            ethertype,
+            vlan_id: 0,
+            payload,
+        }
+    }
+
+    fn env<'a>(config: &'a NetworkRules, peer: Option<&'a PeerCredentials>) -> FilterEnv<'a> {
+        FilterEnv {
+            config,
+            our_address: ME,
+            peer,
+            ownership: None,
+        }
+    }
+
+    fn out(config: &NetworkRules, peer: Option<&PeerCredentials>, f: &Frame) -> FilterDecision {
+        filter_outgoing(&env(config, peer), f, false, &mut || 0u32)
+    }
+
+    fn inc(config: &NetworkRules, peer: Option<&PeerCredentials>, f: &Frame) -> FilterDecision {
+        filter_incoming(&env(config, peer), f, &mut || 0u32)
+    }
+
+    fn verdict_out(rules: Vec<Rule>, f: &Frame) -> Verdict {
+        out(&config(rules), None, f).verdict
+    }
+
+    fn verdict_in(rules: Vec<Rule>, peer: Option<&PeerCredentials>, f: &Frame) -> Verdict {
+        inc(&config(rules), peer, f).verdict
+    }
+
+    /// Whether `[rule, ACCEPT]` accepts the outbound frame.
+    fn matches(rule: &Rule, f: &Frame) -> bool {
+        verdict_out(vec![rule.clone(), accept()], f) == Verdict::Accept
+    }
+
+    fn check(cases: &[(&str, Rule, &Frame, bool)]) {
+        for (name, rule, f, want) in cases {
+            assert_eq!(matches(rule, f), *want, "{name}");
+        }
+    }
+
+    #[test]
+    fn address_vlan_mac_ethertype_and_size_matches() {
+        let raw = [0u8; 100];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let multicast = Frame { zt_dest: None, ..f };
+        let zt = |t, a: [u8; 5]| rule(t, RuleFields::ZtAddress(addr_u64(&a)));
+        let size = |start, end| {
+            rule(
+                MATCH_FRAME_SIZE_RANGE,
+                RuleFields::FrameSizeRange { start, end },
+            )
+        };
+        check(&[
+            ("zt source", zt(MATCH_SOURCE_ZEROTIER_ADDRESS, ME), &f, true),
+            (
+                "zt source other",
+                zt(MATCH_SOURCE_ZEROTIER_ADDRESS, PEER),
+                &f,
+                false,
+            ),
+            ("zt dest", zt(MATCH_DEST_ZEROTIER_ADDRESS, PEER), &f, true),
+            (
+                "zt dest unknown",
+                zt(MATCH_DEST_ZEROTIER_ADDRESS, PEER),
+                &multicast,
+                false,
+            ),
+            (
+                "not zt dest unknown",
+                not(zt(MATCH_DEST_ZEROTIER_ADDRESS, PEER)),
+                &multicast,
+                true,
+            ),
+            (
+                "vlan 0",
+                rule(MATCH_VLAN_ID, RuleFields::VlanId(0)),
+                &f,
+                true,
+            ),
+            (
+                "vlan 7",
+                rule(MATCH_VLAN_ID, RuleFields::VlanId(7)),
+                &f,
+                false,
+            ),
+            // Network.cpp:233: PCP/DEI are unsupported; only 0 matches.
+            (
+                "pcp 0",
+                rule(MATCH_VLAN_PCP, RuleFields::VlanPcp(0)),
+                &f,
+                true,
+            ),
+            (
+                "pcp 3",
+                rule(MATCH_VLAN_PCP, RuleFields::VlanPcp(3)),
+                &f,
+                false,
+            ),
+            (
+                "dei 0",
+                rule(MATCH_VLAN_DEI, RuleFields::VlanDei(0)),
+                &f,
+                true,
+            ),
+            (
+                "dei 1",
+                rule(MATCH_VLAN_DEI, RuleFields::VlanDei(1)),
+                &f,
+                false,
+            ),
+            (
+                "mac source",
+                rule(MATCH_MAC_SOURCE, RuleFields::Mac(mac(ME))),
+                &f,
+                true,
+            ),
+            (
+                "mac dest",
+                rule(MATCH_MAC_DEST, RuleFields::Mac(mac(PEER))),
+                &f,
+                true,
+            ),
+            (
+                "mac dest is not source",
+                rule(MATCH_MAC_DEST, RuleFields::Mac(mac(ME))),
+                &f,
+                false,
+            ),
+            ("ethertype", ethertype(ETHERTYPE_TEST), &f, true),
+            ("other ethertype", ethertype(ETHERTYPE_IPV4), &f, false),
+            (
+                "not other ethertype",
+                not(ethertype(ETHERTYPE_IPV4)),
+                &f,
+                true,
+            ),
+            ("size exact", size(100, 100), &f, true),
+            ("size below", size(0, 99), &f, false),
+            ("size above", size(101, 1500), &f, false),
+        ]);
+    }
+
+    #[test]
+    fn ipv4_address_tos_and_protocol_matches() {
+        let udp4 = ipv4(17, &udp(5000, 53));
+        let f = frame(ETHERTYPE_IPV4, &udp4);
+        let mut tos = udp4.clone();
+        tos[1] = 0xb9; // DSCP 46, ECN 1
+        let f_tos = frame(ETHERTYPE_IPV4, &tos);
+        let arp = [0u8; 28];
+        let f_arp = frame(ETHERTYPE_ARP, &arp);
+        let short = frame(ETHERTYPE_IPV4, &udp4[..19]);
+        let src = |ip, mask| rule(MATCH_IPV4_SOURCE, RuleFields::Ipv4 { ip, mask });
+        let dst = |ip, mask| rule(MATCH_IPV4_DEST, RuleFields::Ipv4 { ip, mask });
+        let tos_rule =
+            |mask, start, end| rule(MATCH_IP_TOS, RuleFields::IpTos { mask, start, end });
+        let proto = |p| rule(MATCH_IP_PROTOCOL, RuleFields::IpProtocol(p));
+        check(&[
+            ("src /32", src(V4_SRC, 32), &f, true),
+            ("src /24", src([10, 1, 2, 0], 24), &f, true),
+            ("src other /24", src([10, 1, 3, 0], 24), &f, false),
+            // IPv4 compares prefixes, so host bits in the rule are ignored.
+            ("src host bits /8", src([10, 9, 9, 9], 8), &f, true),
+            ("src /0", src([1, 2, 3, 4], 0), &f, true),
+            ("dst /24", dst([192, 168, 7, 0], 24), &f, true),
+            ("dst is not src", dst(V4_SRC, 32), &f, false),
+            ("tos masked", tos_rule(0xfc, 0xb8, 0xb8), &f_tos, true),
+            ("tos unmasked", tos_rule(0xff, 0xb8, 0xb8), &f_tos, false),
+            ("tos range", tos_rule(0xfc, 0, 0x10), &f_tos, false),
+            ("udp", proto(17), &f, true),
+            ("not tcp", proto(6), &f, false),
+            // hard_no: a rule that cannot apply is false even under NOT.
+            ("src on arp", src([0, 0, 0, 0], 0), &f_arp, false),
+            ("not src on arp", not(src([1, 1, 1, 1], 32)), &f_arp, false),
+            ("not tos on arp", not(tos_rule(0xff, 1, 1)), &f_arp, false),
+            ("not proto on arp", not(proto(6)), &f_arp, false),
+            ("short header", src([0, 0, 0, 0], 0), &short, false),
+        ]);
+    }
+
+    #[test]
+    fn ipv6_address_traffic_class_and_protocol_matches() {
+        let udp6 = ipv6(17, &udp(5000, 53));
+        let f = frame(ETHERTYPE_IPV6, &udp6);
+        let mut tc = udp6.clone();
+        tc[0] = 0x6b;
+        tc[1] = 0x80; // traffic class 0xb8
+        let f_tc = frame(ETHERTYPE_IPV6, &tc);
+        let udp4 = ipv4(17, &udp(5000, 53));
+        let f4 = frame(ETHERTYPE_IPV4, &udp4);
+        let fd00 = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let src = |ip, mask| rule(MATCH_IPV6_SOURCE, RuleFields::Ipv6 { ip, mask });
+        let dst = |ip, mask| rule(MATCH_IPV6_DEST, RuleFields::Ipv6 { ip, mask });
+        check(&[
+            ("src /128", src(V6_SRC, 128), &f, true),
+            ("src /16", src(fd00, 16), &f, true),
+            // InetAddress::containsAddress masks only the packet address,
+            // so a rule address with host bits set never matches.
+            ("src host bits /64", src(V6_SRC, 64), &f, false),
+            ("src ::/0", src([0; 16], 0), &f, true),
+            ("src fd00::/0", src(fd00, 0), &f, false),
+            ("dst /128", dst(V6_DST, 128), &f, true),
+            ("dst is not src", dst(V6_SRC, 128), &f, false),
+            (
+                "traffic class",
+                rule(
+                    MATCH_IP_TOS,
+                    RuleFields::IpTos {
+                        mask: 0xff,
+                        start: 0xb8,
+                        end: 0xb8,
+                    },
+                ),
+                &f_tc,
+                true,
+            ),
+            (
+                "udp",
+                rule(MATCH_IP_PROTOCOL, RuleFields::IpProtocol(17)),
+                &f,
+                true,
+            ),
+            ("v6 rule on v4", src([0; 16], 0), &f4, false),
+            ("not v6 rule on v4", not(src(V6_SRC, 128)), &f4, false),
+        ]);
+    }
+
+    #[test]
+    fn ipv6_extension_headers_are_walked_like_ipv6_get_payload() {
+        let chain = [ext(43, 0), ext(60, 1), ext(17, 0), udp(1000, 2000)].concat();
+        let walked = ipv6(0, &chain);
+        let f = frame(ETHERTYPE_IPV6, &walked);
+        // Fragment headers (44) are not walked (Network.cpp:64).
+        let fragment = ipv6(44, &[ext(17, 0), udp(1000, 2000)].concat());
+        let f_frag = frame(ETHERTYPE_IPV6, &fragment);
+        let truncated = ipv6(0, &[17, 0, 0, 0]);
+        let f_trunc = frame(ETHERTYPE_IPV6, &truncated);
+        // Header length points past the end of the frame.
+        let overrun = ipv6(0, &ext(17, 5)[..8]);
+        let f_overrun = frame(ETHERTYPE_IPV6, &overrun);
+        let no_next = ipv6(59, &[]);
+        let f_no_next = frame(ETHERTYPE_IPV6, &no_next);
+        let proto = |p| rule(MATCH_IP_PROTOCOL, RuleFields::IpProtocol(p));
+        check(&[
+            ("udp after three headers", proto(17), &f, true),
+            ("not the first header", proto(0), &f, false),
+            ("dest port", dport(2000, 2000), &f, true),
+            ("source port", sport(1000, 1000), &f, true),
+            ("fragment protocol", proto(44), &f_frag, true),
+            ("udp behind fragment", proto(17), &f_frag, false),
+            ("no ports behind fragment", dport(0, 65535), &f_frag, false),
+            ("truncated header", proto(0), &f_trunc, false),
+            ("not on truncated header", not(proto(17)), &f_trunc, false),
+            ("overrunning header", not(proto(17)), &f_overrun, false),
+            ("no next header", proto(59), &f_no_next, true),
+        ]);
+    }
+
+    #[test]
+    fn icmp_type_and_code_matches() {
+        let echo4 = ipv4(1, &[8, 0, 0, 0, 0, 0, 0, 0]);
+        let f = frame(ETHERTYPE_IPV4, &echo4);
+        // IHL 6: the ICMP header starts at byte 24.
+        let mut long_hdr = ipv4(1, &[0, 0, 0, 0, 8, 3]);
+        long_hdr[0] = 0x46;
+        let f_long = frame(ETHERTYPE_IPV4, &long_hdr);
+        let udp4 = ipv4(17, &udp(1, 2));
+        let f_udp = frame(ETHERTYPE_IPV4, &udp4);
+        let echo6 = ipv6(0, &[ext(58, 0), vec![128, 0, 0, 0]].concat());
+        let f6 = frame(ETHERTYPE_IPV6, &echo6);
+        let short6 = ipv6(58, &[128]);
+        let f6_short = frame(ETHERTYPE_IPV6, &short6);
+        let icmp = |icmp_type, icmp_code| {
+            rule(
+                MATCH_ICMP,
+                RuleFields::Icmp {
+                    icmp_type,
+                    icmp_code,
+                },
+            )
+        };
+        check(&[
+            ("type and code", icmp(8, Some(0)), &f, true),
+            ("type only", icmp(8, None), &f, true),
+            ("wrong code", icmp(8, Some(1)), &f, false),
+            ("wrong type", icmp(0, None), &f, false),
+            // Network.cpp:315: a type mismatch is hard_no, so NOT is false too.
+            ("not wrong type", not(icmp(0, None)), &f, false),
+            ("not wrong code", not(icmp(8, Some(1))), &f, true),
+            ("honours ihl", icmp(8, Some(3)), &f_long, true),
+            ("not icmp", icmp(8, None), &f_udp, false),
+            ("not on udp", not(icmp(8, None)), &f_udp, false),
+            ("icmpv6 after hop-by-hop", icmp(128, Some(0)), &f6, true),
+            ("icmpv6 too short", not(icmp(1, None)), &f6_short, false),
+        ]);
+    }
+
+    #[test]
+    fn port_range_matches() {
+        let tcp4 = ipv4(6, &tcp(40000, 22, 0x002));
+        let f = frame(ETHERTYPE_IPV4, &tcp4);
+        let sctp = ipv4(0x84, &udp(9, 53));
+        let udplite = ipv4(0x88, &udp(9, 53));
+        let icmp4 = ipv4(1, &[8, 0, 0, 0, 0, 0, 0, 0]);
+        let short = ipv4(17, &udp(9, 53)[..4]);
+        let zero4 = ipv4(17, &udp(0, 0));
+        let udp6 = ipv6(17, &udp(0, 53));
+        let zero6 = ipv6(17, &udp(9, 0));
+        let arp = [0u8; 28];
+        check(&[
+            ("tcp dest", dport(22, 22), &f, true),
+            ("tcp dest outside", dport(1, 21), &f, false),
+            ("tcp source", sport(40000, 40100), &f, true),
+            ("sctp", dport(53, 53), &frame(ETHERTYPE_IPV4, &sctp), true),
+            (
+                "udplite",
+                dport(53, 53),
+                &frame(ETHERTYPE_IPV4, &udplite),
+                true,
+            ),
+            (
+                "icmp has no ports",
+                dport(0, 65535),
+                &frame(ETHERTYPE_IPV4, &icmp4),
+                false,
+            ),
+            // Network.cpp:365: a portless IPv4 protocol is a plain non-match,
+            // not hard_no, so NOT matches it.
+            (
+                "not on icmp",
+                not(dport(0, 65535)),
+                &frame(ETHERTYPE_IPV4, &icmp4),
+                true,
+            ),
+            // Upstream needs more than four bytes after the IP header.
+            (
+                "ports only",
+                dport(53, 53),
+                &frame(ETHERTYPE_IPV4, &short),
+                false,
+            ),
+            (
+                "v4 port 0",
+                dport(0, 10),
+                &frame(ETHERTYPE_IPV4, &zero4),
+                true,
+            ),
+            (
+                "v6 dest",
+                dport(53, 53),
+                &frame(ETHERTYPE_IPV6, &udp6),
+                true,
+            ),
+            // Network.cpp:385 tests `p > 0` for IPv6.
+            (
+                "v6 source port 0",
+                sport(0, 10),
+                &frame(ETHERTYPE_IPV6, &udp6),
+                false,
+            ),
+            (
+                "v6 dest port 0",
+                dport(0, 10),
+                &frame(ETHERTYPE_IPV6, &zero6),
+                false,
+            ),
+            ("arp", dport(0, 65535), &frame(ETHERTYPE_ARP, &arp), false),
+            (
+                "not on arp",
+                not(dport(0, 65535)),
+                &frame(ETHERTYPE_ARP, &arp),
+                false,
+            ),
+        ]);
+    }
+
+    struct Owns {
+        ip: Vec<u8>,
+        mac: [u8; 6],
+    }
+
+    impl OwnershipCheck for Owns {
+        fn owns_ip(&self, ip: &[u8]) -> bool {
+            ip == self.ip.as_slice()
+        }
+        fn owns_mac(&self, mac: &[u8; 6]) -> bool {
+            *mac == self.mac
+        }
+    }
+
+    #[test]
+    fn characteristics_bits() {
+        let chr = |bits| rule(MATCH_CHARACTERISTICS, RuleFields::Characteristics(bits));
+        let syn4 = ipv4(6, &tcp(1, 2, 0x002));
+        let ns4 = ipv4(6, &tcp(1, 2, 0x100));
+        let syn6 = ipv6(0, &[ext(6, 0), tcp(1, 2, 0x002)].concat());
+        let header_only = ipv4(6, &[]);
+        let raw = [0u8; 10];
+        let mut multicast = frame(ETHERTYPE_TEST, &raw);
+        multicast.mac_dest = [0x33, 0x33, 0, 0, 0, 1];
+        let mut broadcast = multicast;
+        broadcast.mac_dest = [0xff; 6];
+        let target = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let solicit = ipv6(58, &[&[0x87, 0, 0, 0, 0, 0, 0, 0][..], &target].concat());
+        let advert = ipv6(58, &[&[0x88, 0, 0, 0, 0, 0, 0, 0][..], &target].concat());
+        check(&[
+            ("tcp syn", chr(0x002), &frame(ETHERTYPE_IPV4, &syn4), true),
+            ("tcp ack", chr(0x010), &frame(ETHERTYPE_IPV4, &syn4), false),
+            ("tcp ns", chr(0x100), &frame(ETHERTYPE_IPV4, &ns4), true),
+            (
+                "tcp syn v6",
+                chr(0x002),
+                &frame(ETHERTYPE_IPV6, &syn6),
+                true,
+            ),
+            (
+                "truncated tcp",
+                chr(0xfff),
+                &frame(ETHERTYPE_IPV4, &header_only),
+                false,
+            ),
+            (
+                "outbound",
+                chr(CHARACTERISTICS_INBOUND),
+                &frame(ETHERTYPE_TEST, &raw),
+                false,
+            ),
+            (
+                "multicast",
+                chr(CHARACTERISTICS_MULTICAST),
+                &multicast,
+                true,
+            ),
+            (
+                "not broadcast",
+                chr(CHARACTERISTICS_BROADCAST),
+                &multicast,
+                false,
+            ),
+            (
+                "broadcast",
+                chr(CHARACTERISTICS_BROADCAST),
+                &broadcast,
+                true,
+            ),
+            (
+                "broadcast is multicast",
+                chr(CHARACTERISTICS_MULTICAST),
+                &broadcast,
+                true,
+            ),
+            // Network.cpp:409: solicitations count as IP-authenticated.
+            (
+                "neighbor solicitation",
+                chr(CHARACTERISTICS_SENDER_IP_AUTHENTICATED),
+                &frame(ETHERTYPE_IPV6, &solicit),
+                true,
+            ),
+            (
+                "neighbor advertisement",
+                chr(CHARACTERISTICS_SENDER_IP_AUTHENTICATED),
+                &frame(ETHERTYPE_IPV6, &advert),
+                false,
+            ),
+        ]);
+
+        let inbound_rules = config(vec![chr(CHARACTERISTICS_INBOUND), accept()]);
+        let f = inbound(ETHERTYPE_TEST, &raw);
+        assert_eq!(inc(&inbound_rules, None, &f).verdict, Verdict::Accept);
+
+        // Ownership: an advertisement is checked by its target address,
+        // ARP by its sender protocol address, IPv4 by its source.
+        let auth_ip = config(vec![chr(CHARACTERISTICS_SENDER_IP_AUTHENTICATED), accept()]);
+        let auth_mac = config(vec![
+            chr(CHARACTERISTICS_SENDER_MAC_AUTHENTICATED),
+            accept(),
+        ]);
+        let mut arp = [0u8; 28];
+        arp[14..18].copy_from_slice(&V4_SRC);
+        let udp4 = ipv4(17, &udp(1, 2));
+        let owns = |ip: &[u8]| Owns {
+            ip: ip.to_vec(),
+            mac: mac(ME),
+        };
+        for (name, owner, payload, et) in [
+            ("advert target", owns(&target), &advert, ETHERTYPE_IPV6),
+            ("arp sender", owns(&V4_SRC), &arp.to_vec(), ETHERTYPE_ARP),
+            ("ipv4 source", owns(&V4_SRC), &udp4, ETHERTYPE_IPV4),
+        ] {
+            let mut e = env(&auth_ip, None);
+            e.ownership = Some(&owner);
+            let f = frame(et, payload);
+            assert_eq!(
+                filter_outgoing(&e, &f, false, &mut || 0u32).verdict,
+                Verdict::Accept,
+                "{name}"
+            );
+            assert_eq!(
+                filter_outgoing(&env(&auth_ip, None), &f, false, &mut || 0u32).verdict,
+                Verdict::Drop,
+                "{name} without ownership"
+            );
+            let mut e = env(&auth_mac, None);
+            e.ownership = Some(&owner);
+            assert_eq!(
+                filter_outgoing(&e, &f, false, &mut || 0u32).verdict,
+                Verdict::Accept,
+                "{name} mac"
+            );
+        }
+    }
+
+    #[test]
+    fn random_compares_the_prng_against_the_probability() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        for (probability, want) in [
+            (100, Verdict::Accept),
+            (99, Verdict::Drop),
+            (u32::MAX, Verdict::Accept),
+        ] {
+            let rules = config(vec![
+                rule(MATCH_RANDOM, RuleFields::RandomProbability(probability)),
+                accept(),
+            ]);
+            let got = filter_outgoing(&env(&rules, None), &f, false, &mut || 100u32);
+            assert_eq!(got.verdict, want, "probability {probability}");
+        }
+    }
+
+    #[test]
+    fn integer_range_reads_like_upstream() {
+        let int = |start, end, idx, little, bits| {
+            rule(
+                MATCH_INTEGER_RANGE,
+                RuleFields::IntegerRange {
+                    start,
+                    end,
+                    idx,
+                    little,
+                    bits,
+                },
+            )
+        };
+        let raw = [0x12, 0x34, 0x34, 0x12, 0, 0, 0xab, 0xcd, 0, 0];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let mut wide = int(0, 5, 0, true, 8);
+        // Upstream keeps the range end as a u32 delta from start.
+        wide.value[8..16].copy_from_slice(&((1u64 << 32) + 5).to_be_bytes());
+        check(&[
+            ("le 16 at 2", int(0x1234, 0x1234, 2, true, 16), &f, true),
+            ("le is not be", int(0x3412, 0x3412, 2, true, 16), &f, false),
+            // Network.cpp:566 starts big-endian reads `8 - bytes` past idx,
+            // so a 16-bit read at 0 sees bytes 6..8.
+            ("be 16 at 0", int(0xabcd, 0xabcd, 0, false, 16), &f, true),
+            (
+                "be 16 at 0 not bytes 0..2",
+                int(0x1234, 0x1234, 0, false, 16),
+                &f,
+                false,
+            ),
+            (
+                "be 64 at 0",
+                int(0x1234_3412_0000_abcd, 0x1234_3412_0000_abcd, 0, false, 64),
+                &f,
+                true,
+            ),
+            ("be 12 masks", int(0xbcd, 0xbcd, 0, false, 12), &f, true),
+            (
+                "le 12 keeps top bits",
+                int(0x123, 0x123, 2, true, 12),
+                &f,
+                true,
+            ),
+            ("out of frame reads 0", int(0, 0, 100, false, 32), &f, true),
+            ("out of frame not 1..5", int(1, 5, 100, true, 32), &f, false),
+            ("range", int(0x1000, 0x2000, 2, true, 16), &f, true),
+            ("u32 delta", wide, &frame(ETHERTYPE_TEST, &[6]), false),
+        ]);
+    }
+
+    #[test]
+    fn tag_operators_compare_local_and_remote_values() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let mut cfg = config(vec![]);
+        cfg.tags = vec![tag(1, 12, TS)];
+        let mut peer = peer_tags(vec![tag(1, 10, TS)]);
+        let cases = [
+            ("difference", tag_rule(MATCH_TAGS_DIFFERENCE, 1, 2), true),
+            (
+                "difference too far",
+                tag_rule(MATCH_TAGS_DIFFERENCE, 1, 1),
+                false,
+            ),
+            ("and", tag_rule(MATCH_TAGS_BITWISE_AND, 1, 8), true),
+            ("and wrong", tag_rule(MATCH_TAGS_BITWISE_AND, 1, 12), false),
+            ("or", tag_rule(MATCH_TAGS_BITWISE_OR, 1, 14), true),
+            ("xor", tag_rule(MATCH_TAGS_BITWISE_XOR, 1, 6), true),
+            ("equal needs both", tag_rule(MATCH_TAGS_EQUAL, 1, 12), false),
+            ("no local tag", tag_rule(MATCH_TAGS_EQUAL, 2, 0), false),
+            (
+                "not no local tag",
+                not(tag_rule(MATCH_TAGS_EQUAL, 2, 0)),
+                false,
+            ),
+        ];
+        for (name, r, want) in cases {
+            cfg.rules = vec![r, accept()];
+            let got = out(&cfg, Some(&peer), &f).verdict == Verdict::Accept;
+            assert_eq!(got, want, "{name}");
+        }
+        peer.tags = vec![tag(1, 12, TS)];
+        cfg.rules = vec![tag_rule(MATCH_TAGS_EQUAL, 1, 12), accept()];
+        assert_eq!(out(&cfg, Some(&peer), &f).verdict, Verdict::Accept);
+    }
+
+    #[test]
+    fn unknown_remote_tag_is_lenient_outbound_and_strict_inbound() {
+        let raw = [0u8; 10];
+        let f_out = frame(ETHERTYPE_TEST, &raw);
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let mut cfg = config(vec![tag_rule(MATCH_TAGS_EQUAL, 1, 12), accept()]);
+        cfg.tags = vec![tag(1, 12, TS)];
+        assert_eq!(out(&cfg, None, &f_out).verdict, Verdict::Accept);
+        assert_eq!(inc(&cfg, None, &f_in).verdict, Verdict::Drop);
+
+        // A tag outside the credential window counts as unknown.
+        let stale = peer_tags(vec![tag(1, 12, TS + 5_000)]);
+        assert_eq!(inc(&cfg, Some(&stale), &f_in).verdict, Verdict::Drop);
+
+        // Network.cpp:512: the lenient match also skips the next DROP, so
+        // these rules only drop once the peer's tag is known.
+        cfg.rules = vec![tag_rule(MATCH_TAGS_EQUAL, 1, 12), drop_rule(), accept()];
+        assert_eq!(out(&cfg, None, &f_out).verdict, Verdict::Accept);
+        let peer = peer_tags(vec![tag(1, 12, TS)]);
+        assert_eq!(out(&cfg, Some(&peer), &f_out).verdict, Verdict::Drop);
+
+        // skipDrop is only cleared by the DROP it skips, even one in a
+        // later rule set (Network.cpp:136).
+        cfg.rules = vec![
+            tag_rule(MATCH_TAGS_EQUAL, 1, 12),
+            ethertype(ETHERTYPE_IPV6),
+            drop_rule(),
+            drop_rule(),
+            accept(),
+        ];
+        assert_eq!(out(&cfg, None, &f_out).verdict, Verdict::Accept);
+
+        // As a TEE target, inbound matching is lenient too (Network.cpp:501).
+        cfg.rules = vec![
+            ethertype(ETHERTYPE_IPV6),
+            forward(ACTION_TEE, ME, 0),
+            tag_rule(MATCH_TAGS_EQUAL, 1, 12),
+            accept(),
+        ];
+        assert_eq!(inc(&cfg, None, &f_in).verdict, Verdict::SuperAccept);
+    }
+
+    #[test]
+    fn tag_sender_and_receiver_pick_the_right_side() {
+        let raw = [0u8; 10];
+        let f_out = frame(ETHERTYPE_TEST, &raw);
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let mut cfg = config(vec![]);
+        cfg.tags = vec![tag(1, 5, TS)];
+        let peer = peer_tags(vec![tag(1, 7, TS)]);
+        let cases = [
+            (
+                "out sender is us",
+                true,
+                tag_rule(MATCH_TAG_SENDER, 1, 5),
+                Some(&peer),
+                true,
+            ),
+            (
+                "out sender not peer",
+                true,
+                tag_rule(MATCH_TAG_SENDER, 1, 7),
+                Some(&peer),
+                false,
+            ),
+            (
+                "out receiver is peer",
+                true,
+                tag_rule(MATCH_TAG_RECEIVER, 1, 7),
+                Some(&peer),
+                true,
+            ),
+            (
+                "out receiver not us",
+                true,
+                tag_rule(MATCH_TAG_RECEIVER, 1, 5),
+                Some(&peer),
+                false,
+            ),
+            (
+                "out receiver unknown",
+                true,
+                tag_rule(MATCH_TAG_RECEIVER, 1, 7),
+                None,
+                true,
+            ),
+            (
+                "out sender no local tag",
+                true,
+                tag_rule(MATCH_TAG_SENDER, 2, 0),
+                None,
+                false,
+            ),
+            (
+                "in sender is peer",
+                false,
+                tag_rule(MATCH_TAG_SENDER, 1, 7),
+                Some(&peer),
+                true,
+            ),
+            (
+                "in sender unknown",
+                false,
+                tag_rule(MATCH_TAG_SENDER, 1, 7),
+                None,
+                false,
+            ),
+            (
+                "in receiver is us",
+                false,
+                tag_rule(MATCH_TAG_RECEIVER, 1, 5),
+                Some(&peer),
+                true,
+            ),
+        ];
+        for (name, outbound, r, peer, want) in cases {
+            cfg.rules = vec![r, accept()];
+            let got = if outbound {
+                out(&cfg, peer, &f_out).verdict
+            } else {
+                inc(&cfg, peer, &f_in).verdict
+            };
+            assert_eq!(got == Verdict::Accept, want, "{name}");
+        }
+        // The lenient receiver match skips the next DROP as well.
+        cfg.rules = vec![tag_rule(MATCH_TAG_RECEIVER, 1, 7), drop_rule(), accept()];
+        assert_eq!(out(&cfg, None, &f_out).verdict, Verdict::Accept);
+    }
+
+    #[test]
+    fn not_and_or_evaluate_left_to_right() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let t = || ethertype(ETHERTYPE_TEST);
+        let fl = || ethertype(ETHERTYPE_IPV4);
+        let cases = [
+            ("F or T", vec![fl(), or(t()), accept()], Verdict::Accept),
+            // No precedence: (T and F) or T.
+            (
+                "T F or T",
+                vec![t(), fl(), or(t()), accept()],
+                Verdict::Accept,
+            ),
+            (
+                "T or T F",
+                vec![t(), or(t()), fl(), accept()],
+                Verdict::Drop,
+            ),
+            (
+                "F or not F",
+                vec![fl(), or(not(fl())), accept()],
+                Verdict::Accept,
+            ),
+            ("not T", vec![not(t()), accept()], Verdict::Drop),
+            ("not F", vec![not(fl()), accept()], Verdict::Accept),
+            (
+                "sets reset after an action",
+                vec![fl(), accept(), t(), accept()],
+                Verdict::Accept,
+            ),
+            (
+                "unmatched drop",
+                vec![fl(), drop_rule(), accept()],
+                Verdict::Accept,
+            ),
+            ("bare accept", vec![accept()], Verdict::Accept),
+            ("bare drop", vec![drop_rule(), accept()], Verdict::Drop),
+            ("no rules", vec![], Verdict::Drop),
+            ("nothing matches", vec![fl(), accept()], Verdict::Drop),
+            (
+                "unknown action is a no-op",
+                vec![action(0x0a), accept()],
+                Verdict::Accept,
+            ),
+        ];
+        for (name, rules, want) in cases {
+            assert_eq!(verdict_out(rules, &f), want, "{name}");
+        }
+        assert_eq!(
+            verdict_in(vec![], None, &inbound(ETHERTYPE_TEST, &raw)),
+            Verdict::Drop
+        );
+    }
+
+    #[test]
+    fn and_short_circuits_but_or_is_always_evaluated() {
+        // Network.cpp:212: a false set skips ANDed matches but still
+        // evaluates ORed ones, which matters for side effects.
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let random = || rule(MATCH_RANDOM, RuleFields::RandomProbability(u32::MAX));
+        let cases = [
+            (
+                vec![ethertype(ETHERTYPE_IPV4), random(), accept()],
+                0,
+                Verdict::Drop,
+            ),
+            (
+                vec![ethertype(ETHERTYPE_IPV4), or(random()), accept()],
+                1,
+                Verdict::Accept,
+            ),
+            (
+                vec![ethertype(ETHERTYPE_TEST), random(), accept()],
+                1,
+                Verdict::Accept,
+            ),
+        ];
+        for (rules, calls, want) in cases {
+            let cfg = config(rules);
+            let count = Cell::new(0);
+            let mut rng = || {
+                count.set(count.get() + 1);
+                0u32
+            };
+            let got = filter_outgoing(&env(&cfg, None), &f, false, &mut rng).verdict;
+            assert_eq!((got, count.get()), (want, calls));
+        }
+    }
+
+    #[test]
+    fn unsupported_matches_take_the_network_flag() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        for rule_type in [20u8, 62] {
+            let mut cfg = config(vec![action(rule_type), accept()]);
+            assert_eq!(out(&cfg, None, &f).verdict, Verdict::Drop);
+            cfg.flags = NETWORK_FLAG_RULES_RESULT_OF_UNSUPPORTED_MATCH;
+            assert_eq!(out(&cfg, None, &f).verdict, Verdict::Accept);
+        }
+    }
+
+    #[test]
+    fn break_and_capabilities() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let t = || ethertype(ETHERTYPE_TEST);
+        let brk = || action(ACTION_BREAK);
+
+        // BREAK ends the network rules with no verdict.
+        let mut cfg = config(vec![t(), brk(), accept()]);
+        assert_eq!(out(&cfg, None, &f).verdict, Verdict::Drop);
+        cfg.capabilities = vec![cap(1, vec![accept()], TS)];
+        let d = out(&cfg, None, &f);
+        assert_eq!((d.verdict, d.capability_id), (Verdict::Accept, Some(1)));
+        cfg.rules = vec![ethertype(ETHERTYPE_IPV4), brk(), accept()];
+        assert_eq!(out(&cfg, None, &f).capability_id, None);
+
+        // Capabilities run in order; BREAK or DROP only ends that one.
+        cfg.rules = vec![];
+        cfg.capabilities = vec![
+            cap(1, vec![t(), brk(), accept()], TS),
+            cap(2, vec![drop_rule()], TS),
+            cap(3, vec![t(), accept()], TS),
+            cap(4, vec![accept()], TS),
+        ];
+        let d = out(&cfg, None, &f);
+        assert_eq!((d.verdict, d.capability_id), (Verdict::Accept, Some(3)));
+
+        // A DROP in the network rules is final.
+        cfg.rules = vec![drop_rule()];
+        assert_eq!(out(&cfg, None, &f).verdict, Verdict::Drop);
+    }
+
+    #[test]
+    fn inbound_frames_use_the_senders_capabilities() {
+        let raw = [0u8; 10];
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let f_out = frame(ETHERTYPE_TEST, &raw);
+        let mut cfg = config(vec![]);
+        cfg.capabilities = vec![cap(1, vec![accept()], TS)];
+        assert_eq!(inc(&cfg, None, &f_in).verdict, Verdict::Drop);
+
+        let mut peer = peer_caps(vec![cap(5, vec![accept()], TS)]);
+        let d = inc(&config(vec![]), Some(&peer), &f_in);
+        assert_eq!((d.verdict, d.capability_id), (Verdict::Accept, Some(5)));
+        // Outbound only uses our own capabilities.
+        assert_eq!(
+            out(&config(vec![]), Some(&peer), &f_out).verdict,
+            Verdict::Drop
+        );
+
+        peer.capabilities = vec![cap(5, vec![accept()], TS - 1_001)];
+        assert_eq!(
+            inc(&config(vec![]), Some(&peer), &f_in).verdict,
+            Verdict::Drop
+        );
+    }
+
+    #[test]
+    fn tee_and_watch_return_copies() {
+        let raw = [0u8; 100];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let copy = |to, length, ext_frame_flags| {
+            Some(FrameCopy {
+                to,
+                length,
+                ext_frame_flags,
+            })
+        };
+        let cases = [
+            (
+                "tee",
+                vec![forward(ACTION_TEE, OTHER, 0), accept()],
+                copy(OTHER, 100, 0x02),
+            ),
+            (
+                "tee prefix",
+                vec![forward(ACTION_TEE, OTHER, 40), accept()],
+                copy(OTHER, 40, 0x02),
+            ),
+            (
+                "tee long",
+                vec![forward(ACTION_TEE, OTHER, 400), accept()],
+                copy(OTHER, 100, 0x02),
+            ),
+            (
+                "watch",
+                vec![forward(ACTION_WATCH, OTHER, 0), accept()],
+                copy(OTHER, 100, 0x16),
+            ),
+            (
+                "to source",
+                vec![forward(ACTION_TEE, ME, 0), accept()],
+                None,
+            ),
+            (
+                "to dest",
+                vec![forward(ACTION_TEE, PEER, 0), accept()],
+                None,
+            ),
+            (
+                "last tee wins",
+                vec![
+                    forward(ACTION_TEE, OTHER, 0),
+                    forward(ACTION_WATCH, OTHER2, 8),
+                    accept(),
+                ],
+                copy(OTHER2, 8, 0x16),
+            ),
+        ];
+        for (name, rules, want) in cases {
+            let d = out(&config(rules), None, &f);
+            assert_eq!((d.verdict, d.tee), (Verdict::Accept, want), "{name}");
+        }
+
+        let tee = config(vec![forward(ACTION_TEE, OTHER, 0), accept()]);
+        assert_eq!(inc(&tee, None, &f_in).tee, copy(OTHER, 100, 0x08));
+        let watch = config(vec![forward(ACTION_WATCH, OTHER, 0), accept()]);
+        assert_eq!(inc(&watch, None, &f_in).tee, copy(OTHER, 100, 0x1c));
+
+        let d = filter_outgoing(&env(&tee, None), &f, true, &mut || 0u32);
+        assert_eq!((d.verdict, d.tee), (Verdict::Accept, None), "no_tee");
+
+        // Copies only go out when the frame is accepted.
+        for rules in [
+            vec![forward(ACTION_TEE, OTHER, 0), drop_rule()],
+            vec![forward(ACTION_TEE, OTHER, 0)],
+        ] {
+            let d = out(&config(rules), None, &f);
+            assert_eq!((d.verdict, d.copies().count()), (Verdict::Drop, 0));
+        }
+
+        // A network-rule TEE survives into a capability's accept, and the
+        // capability's own copy is sent first.
+        let mut cfg = config(vec![forward(ACTION_TEE, OTHER, 0)]);
+        cfg.capabilities = vec![cap(
+            1,
+            vec![forward(ACTION_WATCH, OTHER2, 10), accept()],
+            TS,
+        )];
+        let d = out(&cfg, None, &f);
+        let copies: Vec<FrameCopy> = d.copies().copied().collect();
+        assert_eq!(
+            copies,
+            vec![
+                copy(OTHER2, 10, 0x16).unwrap(),
+                copy(OTHER, 100, 0x02).unwrap()
+            ]
+        );
+
+        // A capability that does not accept loses its TEE.
+        cfg.capabilities = vec![
+            cap(
+                1,
+                vec![forward(ACTION_TEE, OTHER2, 0), action(ACTION_BREAK)],
+                TS,
+            ),
+            cap(2, vec![accept()], TS),
+        ];
+        let d = out(&cfg, None, &f);
+        assert_eq!((d.capability_id, d.capability_tee), (Some(2), None));
+    }
+
+    #[test]
+    fn redirect_drops_locally_and_returns_the_target() {
+        let raw = [0u8; 100];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let redirect = |to| forward(ACTION_REDIRECT, to, 0);
+        let copy = |to, ext_frame_flags| {
+            Some(FrameCopy {
+                to,
+                length: 100,
+                ext_frame_flags,
+            })
+        };
+
+        let d = out(&config(vec![redirect(OTHER)]), None, &f);
+        assert_eq!((d.verdict, d.redirect), (Verdict::Drop, copy(OTHER, 0x04)));
+        let d = inc(&config(vec![redirect(OTHER)]), None, &f_in);
+        assert_eq!((d.verdict, d.redirect), (Verdict::Drop, copy(OTHER, 0x0a)));
+
+        // Redirecting to the destination, or to ourselves outbound, is a
+        // no-op; inbound, being the target super-accepts.
+        assert_eq!(
+            verdict_out(vec![redirect(PEER), accept()], &f),
+            Verdict::Accept
+        );
+        assert_eq!(verdict_out(vec![redirect(ME)], &f), Verdict::Drop);
+        let d = inc(&config(vec![redirect(ME)]), None, &f_in);
+        assert_eq!((d.verdict, d.redirect), (Verdict::SuperAccept, None));
+
+        let mut cfg = config(vec![]);
+        cfg.capabilities = vec![cap(7, vec![redirect(OTHER)], TS)];
+        let d = out(&cfg, None, &f);
+        assert_eq!(
+            (d.verdict, d.capability_id, d.redirect),
+            (Verdict::Drop, Some(7), copy(OTHER, 0x04))
+        );
+
+        let d = out(
+            &config(vec![forward(ACTION_TEE, OTHER2, 0), redirect(OTHER)]),
+            None,
+            &f,
+        );
+        let to: Vec<[u8; 5]> = d.copies().map(|c| c.to).collect();
+        assert_eq!((d.verdict, to), (Verdict::Drop, vec![OTHER2, OTHER]));
+    }
+
+    #[test]
+    fn inbound_forward_targets_super_accept() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let f_in = inbound(ETHERTYPE_TEST, &raw);
+        let miss = || ethertype(ETHERTYPE_IPV4);
+        // Network.cpp:163: a taken TEE to us super-accepts at once.
+        assert_eq!(
+            verdict_in(vec![forward(ACTION_TEE, ME, 0)], None, &f_in),
+            Verdict::SuperAccept
+        );
+        // Network.cpp:191: so does a later ACCEPT after an untaken one.
+        let rules = vec![miss(), forward(ACTION_WATCH, ME, 0), accept()];
+        assert_eq!(verdict_in(rules.clone(), None, &f_in), Verdict::SuperAccept);
+        assert_eq!(verdict_out(rules, &f), Verdict::Accept);
+        let rules = vec![miss(), forward(ACTION_WATCH, OTHER, 0), accept()];
+        assert_eq!(verdict_in(rules, None, &f_in), Verdict::Accept);
+    }
+
+    #[test]
+    fn priority_sets_the_qos_bucket() {
+        let raw = [0u8; 10];
+        let f = frame(ETHERTYPE_TEST, &raw);
+        let cases = [
+            (vec![priority(&[2])], Some(2)),
+            (vec![priority(&[9])], Some(DEFAULT_QOS_BUCKET)),
+            // What a PRIORITY parsed off the wire carries.
+            (vec![priority(&[])], Some(0)),
+            (
+                vec![ethertype(ETHERTYPE_IPV4), priority(&[2]), accept()],
+                None,
+            ),
+        ];
+        for (rules, want) in cases {
+            let d = out(&config(rules), None, &f);
+            assert_eq!((d.verdict, d.qos_bucket), (Verdict::Accept, want));
+        }
+        let d = inc(
+            &config(vec![priority(&[2])]),
+            None,
+            &inbound(ETHERTYPE_TEST, &raw),
+        );
+        assert_eq!((d.verdict, d.qos_bucket), (Verdict::Accept, None));
+    }
+
+    fn signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    #[test]
+    fn network_rules_from_a_config_dictionary() {
+        let key = signing_key();
+        let caps = [Capability {
+            id: 1,
+            rules: vec![ethertype(ETHERTYPE_IPV4), accept()],
+        }];
+        let tags = [Tag { id: 2, value: 5 }, Tag { id: 1, value: 7 }];
+        let mut dict = Dictionary::new();
+        dict.add_text("nwid", &alloc::format!("{NWID:016x}"));
+        dict.add_hex("ts", TS);
+        dict.add_hex("ctmd", 1_000);
+        dict.add_hex("f", NETWORK_FLAG_RULES_RESULT_OF_UNSUPPORTED_MATCH);
+        dict.add_binary("R", serialize_rules(&[ethertype(ETHERTYPE_ARP), accept()]));
+        dict.add_binary(
+            "CAP",
+            serialize_capabilities_signed(&caps, NWID, &ME, &CONTROLLER, TS, &key),
+        );
+        dict.add_binary(
+            "TAG",
+            serialize_tags_signed(&tags, NWID, &ME, &CONTROLLER, TS, &key),
+        );
+        let dict = Dictionary::deserialize(&dict.serialize()).unwrap();
+
+        let cfg = NetworkRules::from_dictionary(&dict).unwrap();
+        assert_eq!(cfg.network_id, NWID);
+        assert_eq!(cfg.timestamp, TS);
+        assert_eq!(cfg.credential_time_max_delta, 1_000);
+        assert_eq!(cfg.flags, NETWORK_FLAG_RULES_RESULT_OF_UNSUPPORTED_MATCH);
+        assert_eq!(cfg.rules, vec![ethertype(ETHERTYPE_ARP), accept()]);
+        assert_eq!(cfg.capabilities.len(), 1);
+        assert!(cfg.capabilities[0].verify(&key.verifying_key()));
+        let tag_ids: Vec<u32> = cfg.tags.iter().map(|t| t.tag.id).collect();
+        assert_eq!(tag_ids, vec![1, 2]);
+        assert_eq!(cfg.local_tag(2), Some(5));
+
+        let v4 = ipv4(17, &udp(1, 2));
+        let v6 = ipv6(17, &udp(1, 2));
+        let d = out(&cfg, None, &frame(ETHERTYPE_IPV4, &v4));
+        assert_eq!((d.verdict, d.capability_id), (Verdict::Accept, Some(1)));
+        assert_eq!(
+            out(&cfg, None, &frame(ETHERTYPE_IPV6, &v6)).verdict,
+            Verdict::Drop
+        );
+
+        // No R key: no rules, so everything is dropped.
+        let empty = NetworkRules::from_dictionary(&Dictionary::new()).unwrap();
+        assert!(empty.rules.is_empty());
+        let raw = [0u8; 4];
+        assert_eq!(
+            out(&empty, None, &frame(ETHERTYPE_TEST, &raw)).verdict,
+            Verdict::Drop
+        );
+
+        let mut bad = Dictionary::new();
+        bad.add_binary("R", vec![MATCH_ETHERTYPE]);
+        assert_eq!(
+            NetworkRules::from_dictionary(&bad),
+            Err(RuleParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn peer_credentials_follow_upstream_add_rules() {
+        let key = signing_key();
+        let vk = key.verifying_key();
+        let cfg = config(vec![]);
+        let signed_tag = |value, ts| {
+            let bytes =
+                serialize_tags_signed(&[Tag { id: 1, value }], NWID, &PEER, &CONTROLLER, ts, &key);
+            TagCredential::deserialize(&bytes).unwrap().0
+        };
+        let mut peer = PeerCredentials::default();
+        assert_eq!(
+            peer.add_tag(&cfg, signed_tag(5, TS), &vk),
+            AddCredentialResult::AcceptedNew
+        );
+        assert_eq!(
+            peer.add_tag(&cfg, signed_tag(5, TS), &vk),
+            AddCredentialResult::AcceptedRedundant
+        );
+        assert_eq!(
+            peer.add_tag(&cfg, signed_tag(6, TS - 1), &vk),
+            AddCredentialResult::Rejected
+        );
+        assert_eq!(
+            peer.add_tag(&cfg, signed_tag(6, TS + 1), &vk),
+            AddCredentialResult::AcceptedNew
+        );
+        assert_eq!(peer.tag(&cfg, 1), Some(6));
+
+        let mut forged = signed_tag(9, TS + 2);
+        forged.tag.value = 10;
+        assert_eq!(
+            peer.add_tag(&cfg, forged, &vk),
+            AddCredentialResult::Rejected
+        );
+        let mut foreign = signed_tag(9, TS + 2);
+        foreign.network_id = NWID + 1;
+        assert_eq!(
+            peer.add_tag(&cfg, foreign, &vk),
+            AddCredentialResult::Rejected
+        );
+
+        let signed_cap = |id, ts| {
+            let caps = [Capability {
+                id,
+                rules: vec![accept()],
+            }];
+            let bytes = serialize_capabilities_signed(&caps, NWID, &PEER, &CONTROLLER, ts, &key);
+            CapabilityCredential::deserialize(&bytes).unwrap().0
+        };
+        assert_eq!(
+            peer.add_capability(&cfg, signed_cap(9, TS), &vk),
+            AddCredentialResult::AcceptedNew
+        );
+        assert_eq!(
+            peer.add_capability(&cfg, signed_cap(3, TS), &vk),
+            AddCredentialResult::AcceptedNew
+        );
+        assert_eq!(
+            peer.add_capability(&cfg, signed_cap(3, TS), &vk),
+            AddCredentialResult::AcceptedRedundant
+        );
+        let ids: Vec<u32> = peer.capabilities.iter().map(|c| c.capability.id).collect();
+        assert_eq!(ids, vec![3, 9]);
+
+        let later = NetworkRules {
+            timestamp: TS + 1_000,
+            ..config(vec![])
+        };
+        assert_eq!(
+            peer.add_capability(&later, signed_cap(4, TS - 5), &vk),
+            AddCredentialResult::AcceptedNew
+        );
+        peer.clean(&later);
+        let ids: Vec<u32> = peer.capabilities.iter().map(|c| c.capability.id).collect();
+        assert_eq!((ids, peer.tags.len()), (vec![3, 9], 1));
+    }
+}
