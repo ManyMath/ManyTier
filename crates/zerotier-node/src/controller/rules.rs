@@ -550,18 +550,15 @@ pub fn serialize_tags_signed(
     let mut buf = Vec::with_capacity(tags.len() * 135);
     for tag in tags {
         let signed_data = tag_signed_data(network_id, timestamp, tag, issued_to, signed_by);
-        let signature = zerotier_crypto::signing::sign(signing_key, &signed_data);
-
-        buf.extend_from_slice(&network_id.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes());
-        buf.extend_from_slice(&tag.id.to_be_bytes());
-        buf.extend_from_slice(&tag.value.to_be_bytes());
-        buf.extend_from_slice(issued_to);
-        buf.extend_from_slice(signed_by);
-        buf.push(SIGNATURE_TYPE_ED25519);
-        buf.extend_from_slice(&(SIGNATURE_LEN as u16).to_be_bytes());
-        buf.extend_from_slice(&signature);
-        buf.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
+        TagCredential {
+            network_id,
+            timestamp,
+            tag: tag.clone(),
+            issued_to: *issued_to,
+            signed_by: *signed_by,
+            signature: zerotier_crypto::signing::sign(signing_key, &signed_data),
+        }
+        .serialize(&mut buf);
     }
     buf
 }
@@ -591,21 +588,18 @@ pub fn serialize_capabilities_signed(
     let mut buf = Vec::new();
     for cap in caps {
         let signed_data = capability_signed_data(network_id, timestamp, cap, 1);
-        let signature = zerotier_crypto::signing::sign(signing_key, &signed_data);
-
-        buf.extend_from_slice(&network_id.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes());
-        buf.extend_from_slice(&cap.id.to_be_bytes());
-        buf.extend_from_slice(&(cap.rules.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&serialize_rules(&cap.rules));
-        buf.push(1); // max_custody_chain_length
-        buf.extend_from_slice(issued_to); // custody[0].to
-        buf.extend_from_slice(signed_by); // custody[0].from
-        buf.push(SIGNATURE_TYPE_ED25519);
-        buf.extend_from_slice(&(SIGNATURE_LEN as u16).to_be_bytes());
-        buf.extend_from_slice(&signature);
-        buf.extend_from_slice(&[0u8; 5]); // terminate custody chain
-        buf.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
+        CapabilityCredential {
+            network_id,
+            timestamp,
+            capability: cap.clone(),
+            max_custody_chain_length: 1,
+            custody: vec![CustodyLink {
+                to: *issued_to,
+                from: *signed_by,
+                signature: zerotier_crypto::signing::sign(signing_key, &signed_data),
+            }],
+        }
+        .serialize(&mut buf);
     }
     buf
 }
@@ -867,6 +861,20 @@ impl TagCredential {
         Ok((tag, r.pos))
     }
 
+    /// Port of upstream `Tag::serialize`.
+    pub fn serialize(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.network_id.to_be_bytes());
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.tag.id.to_be_bytes());
+        buf.extend_from_slice(&self.tag.value.to_be_bytes());
+        buf.extend_from_slice(&self.issued_to);
+        buf.extend_from_slice(&self.signed_by);
+        buf.push(SIGNATURE_TYPE_ED25519);
+        buf.extend_from_slice(&(SIGNATURE_LEN as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signature);
+        buf.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
+    }
+
     /// Port of upstream `Tag::verify` given the controller's key: the tag
     /// must be signed by its network's controller.
     pub fn verify(&self, controller_key: &ed25519_dalek::VerifyingKey) -> bool {
@@ -947,6 +955,25 @@ impl CapabilityCredential {
             custody,
         };
         Ok((cap, r.pos))
+    }
+
+    /// Port of upstream `Capability::serialize`.
+    pub fn serialize(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.network_id.to_be_bytes());
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.capability.id.to_be_bytes());
+        buf.extend_from_slice(&(self.capability.rules.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&serialize_rules(&self.capability.rules));
+        buf.push(self.max_custody_chain_length);
+        for link in &self.custody {
+            buf.extend_from_slice(&link.to);
+            buf.extend_from_slice(&link.from);
+            buf.push(SIGNATURE_TYPE_ED25519);
+            buf.extend_from_slice(&(SIGNATURE_LEN as u16).to_be_bytes());
+            buf.extend_from_slice(&link.signature);
+        }
+        buf.extend_from_slice(&[0u8; 5]); // terminate custody chain
+        buf.extend_from_slice(&0u16.to_be_bytes()); // additional_fields_len
     }
 
     /// The last holder in the chain of custody (upstream
@@ -1841,6 +1868,24 @@ mod tests {
             tags,
             vec![Tag { id: 10, value: 2 }, Tag { id: 20, value: 1 }]
         );
+    }
+
+    #[test]
+    fn credentials_serialize_to_the_bytes_they_were_read_from() {
+        let tag_bytes = signed_tag_bytes(Tag { id: 7, value: 8 }, &CONTROLLER);
+        let (tag, used) = TagCredential::deserialize(&tag_bytes).unwrap();
+        let mut out = Vec::new();
+        tag.serialize(&mut out);
+        assert_eq!((used, out), (tag_bytes.len(), tag_bytes));
+
+        let cap_bytes = signed_capability_bytes(&Capability {
+            id: 4,
+            rules: default_allow_all(),
+        });
+        let (cap, used) = CapabilityCredential::deserialize(&cap_bytes).unwrap();
+        let mut out = Vec::new();
+        cap.serialize(&mut out);
+        assert_eq!((used, out), (cap_bytes.len(), cap_bytes));
     }
 
     #[test]
