@@ -12,6 +12,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use zerotier_protocol::verbs::network_config::{CertificateOfMembership, ComQualifier};
 
 use crate::ethernet;
+use crate::filter::{NetworkRules, PeerCredentials};
 use crate::multicast::MulticastGroupKey;
 
 pub const COM_QUALIFIER_TIMESTAMP_ID: u64 = 0;
@@ -126,6 +127,12 @@ pub struct NetworkMembership {
     pub multicast_groups: Vec<MulticastGroupKey>,
     /// Most recipients one multicast is sent to (config `ml`).
     pub multicast_limit: u32,
+    /// Flow rules, capabilities and tags from the network config. `None`
+    /// until a config carries them (static test configs never do), in
+    /// which case frames are not filtered.
+    pub rules: Option<NetworkRules>,
+    /// Tags and capabilities other members presented, by member.
+    pub peer_credentials: BTreeMap<[u8; 5], PeerCredentials>,
 }
 
 impl NetworkMembership {
@@ -149,6 +156,8 @@ impl NetworkMembership {
             broadcast_enabled: true,
             multicast_groups: Vec::new(),
             multicast_limit: DEFAULT_MULTICAST_LIMIT,
+            rules: None,
+            peer_credentials: BTreeMap::new(),
         }
     }
 

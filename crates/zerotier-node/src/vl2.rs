@@ -648,9 +648,7 @@ fn send_unicast_frame(
         });
         return;
     };
-    if let Some(push) = node.credentials_if_needed(network_id, &member_address, now_ms) {
-        actions.push(push);
-    }
+    actions.extend(node.credentials_if_needed(network_id, &member_address, now_ms));
     let our_zt_address = *node.identity.address.as_bytes();
     let ext = ExtFramePayload {
         network_id,
@@ -734,9 +732,7 @@ fn send_multicast_frame(
         else {
             continue;
         };
-        if let Some(push) = node.credentials_if_needed(network_id, &target, now_ms) {
-            actions.push(push);
-        }
+        actions.extend(node.credentials_if_needed(network_id, &target, now_ms));
         let packet_id = node.allocate_packet_id();
         if let Some(packet) = build_encrypted_verb_packet(
             packet_id,

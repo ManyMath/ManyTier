@@ -229,6 +229,8 @@ impl NetworkMembership {
             } else {
                 crate::network::DEFAULT_MULTICAST_LIMIT
             },
+            rules: None,
+            peer_credentials: Default::default(),
         })
     }
 }

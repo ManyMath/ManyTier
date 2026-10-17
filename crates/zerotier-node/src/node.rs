@@ -15,7 +15,7 @@ use zerotier_crypto::aes_gmac_siv;
 use zerotier_crypto::identity::Identity;
 use zerotier_crypto::salsa;
 use zerotier_protocol::constants::*;
-use zerotier_protocol::fragment::ReassemblyBuffer;
+use zerotier_protocol::fragment::{fragment_packet, ReassemblyBuffer};
 use zerotier_protocol::inet_address::InetAddress;
 use zerotier_protocol::verb::Verb;
 use zerotier_protocol::verbs::ack::AckPayload;
@@ -1804,14 +1804,13 @@ impl Node {
 
         let failure = match error.error_code {
             ErrorCode::NeedMembershipCertificate => {
-                if let Some(action) = self.credentials_packet(
+                let push = self.credentials_packets(
                     network_id,
                     &source,
                     now_ms,
                     ZT_PEER_CREDENTIALS_REQUEST_RATE_LIMIT,
-                ) {
-                    self.actions.push(action);
-                }
+                );
+                self.actions.extend(push);
                 return;
             }
             ErrorCode::ObjectNotFound | ErrorCode::UnsupportedOperation => ConfigFailure::NotFound,
@@ -1835,50 +1834,121 @@ impl Node {
         }
     }
 
-    /// NETWORK_CREDENTIALS carrying our COM for `network_id`, addressed to
-    /// `peer`, unless we pushed them within `min_interval_ms` (and no newer
-    /// config arrived since). Mirrors ZeroTierOne's
-    /// `Network::pushCredentialsIfNeeded` / `peerRequestedCredentials`.
-    pub(crate) fn credentials_packet(
+    /// File the tags and capabilities from a NETWORK_CREDENTIALS under the
+    /// member each was issued to, as ZeroTierOne's Network::addCredential
+    /// does, verified against the network controller's key. Networks whose
+    /// config carried no rules ignore them.
+    fn add_peer_tags_and_capabilities(&mut self, sections: &[u8]) {
+        let Ok((capabilities, tags)) =
+            crate::controller::rules::deserialize_credential_sections(sections)
+        else {
+            return;
+        };
+        let controller_key = |node: &Self, network_id: u64| {
+            node.topology
+                .get_peer(&controller_address_from_network_id(network_id))
+                .and_then(|peer| {
+                    ed25519_dalek::VerifyingKey::from_bytes(&peer.identity.public_key.signing).ok()
+                })
+        };
+        for tag in tags {
+            let Some(key) = controller_key(self, tag.network_id) else {
+                continue;
+            };
+            if let Some(net) = self.find_network_mut(tag.network_id) {
+                if let Some(rules) = &net.rules {
+                    let member = tag.issued_to;
+                    net.peer_credentials
+                        .entry(member)
+                        .or_default()
+                        .add_tag(rules, tag, &key);
+                }
+            }
+        }
+        for capability in capabilities {
+            let Some(key) = controller_key(self, capability.network_id) else {
+                continue;
+            };
+            if let Some(net) = self.find_network_mut(capability.network_id) {
+                if let Some(rules) = &net.rules {
+                    let member = capability.issued_to();
+                    net.peer_credentials
+                        .entry(member)
+                        .or_default()
+                        .add_capability(rules, capability, &key);
+                }
+            }
+        }
+    }
+
+    /// NETWORK_CREDENTIALS carrying our COM, capabilities and tags for
+    /// `network_id`, addressed to `peer`, unless we pushed them within
+    /// `min_interval_ms` (and no newer config arrived since). Mirrors
+    /// ZeroTierOne's `Network::pushCredentialsIfNeeded` /
+    /// `peerRequestedCredentials`; what does not fit one packet goes on in
+    /// further packets without the COM, as `Membership::pushCredentials`
+    /// sends it.
+    pub(crate) fn credentials_packets(
         &mut self,
         network_id: u64,
         peer: &[u8; 5],
         now_ms: u64,
         min_interval_ms: u64,
-    ) -> Option<NodeAction> {
-        let net = self.find_network(network_id)?;
-        let com = net.our_com.clone()?;
+    ) -> Vec<NodeAction> {
+        let Some(net) = self.find_network(network_id) else {
+            return Vec::new();
+        };
+        let Some(com) = net.our_com.clone() else {
+            return Vec::new();
+        };
         if let Some(last) = net.credentials_pushed.get(peer) {
             if now_ms.saturating_sub(*last) <= min_interval_ms {
-                return None;
+                return Vec::new();
             }
         }
-        let secret = self.shared_secret_for_peer(peer)?;
-        let address = self.topology.get_peer(peer)?.best_path(now_ms)?.address;
-
-        let payload = NetworkCredentialsPayload {
-            coms: vec![com],
-            sections: NetworkCredentialsPayload::sections_from(0, &[], 0, &[]),
+        let sections = match &net.rules {
+            Some(rules) => credential_sections(&rules.capabilities, &rules.tags),
+            None => vec![NetworkCredentialsPayload::sections_from(0, &[], 0, &[])],
         };
-        let mut buf = vec![0u8; 1024];
-        let len = payload.serialize(&mut buf);
-        let packet_id = self.allocate_packet_id();
+        let (Some(secret), Some(address)) = (
+            self.shared_secret_for_peer(peer),
+            self.topology
+                .get_peer(peer)
+                .and_then(|peer| peer.best_path(now_ms))
+                .map(|path| path.address),
+        ) else {
+            return Vec::new();
+        };
+
         let our_address = *self.identity.address.as_bytes();
-        let packet = crate::vl2::build_encrypted_verb_packet(
-            packet_id,
-            &our_address,
-            peer,
-            Verb::NetworkCredentials,
-            &buf[..len],
-            &secret,
-        )?;
+        let mut actions = Vec::new();
+        let mut com = Some(com);
+        for sections in sections {
+            let payload = NetworkCredentialsPayload {
+                coms: com.take().into_iter().collect(),
+                sections,
+            };
+            let mut buf = vec![0u8; 1024 + payload.sections.len()];
+            let len = payload.serialize(&mut buf);
+            let packet_id = self.allocate_packet_id();
+            let Some(packet) = crate::vl2::build_encrypted_verb_packet(
+                packet_id,
+                &our_address,
+                peer,
+                Verb::NetworkCredentials,
+                &buf[..len],
+                &secret,
+            ) else {
+                continue;
+            };
+            for data in fragment_packet(&packet, ZT_DEFAULT_PHYSMTU).unwrap_or_default() {
+                actions.push(NodeAction::SendTo { data, address });
+            }
+        }
         if let Some(net) = self.find_network_mut(network_id) {
             net.credentials_pushed.insert(*peer, now_ms);
         }
-        Some(NodeAction::SendTo {
-            data: packet,
-            address,
-        })
+        actions
     }
 
     /// Push our credentials before sending `peer` its first frame, and again
@@ -1888,8 +1958,8 @@ impl Node {
         network_id: u64,
         peer: &[u8; 5],
         now_ms: u64,
-    ) -> Option<NodeAction> {
-        self.credentials_packet(network_id, peer, now_ms, ZT_PEER_ACTIVITY_TIMEOUT)
+    ) -> Vec<NodeAction> {
+        self.credentials_packets(network_id, peer, now_ms, ZT_PEER_ACTIVITY_TIMEOUT)
     }
 
     /// Ask `peer` for its credentials after dropping a frame it sent us
@@ -2233,12 +2303,43 @@ impl Node {
             .and_then(|dict| dict.get_hex_u64("ml"))
             .and_then(|limit| u32::try_from(limit).ok())
             .unwrap_or(crate::network::DEFAULT_MULTICAST_LIMIT);
+        // Upstream reads rules only from version 6 configs on; its legacy
+        // reader accepts everything on older ones.
+        let rules = dict.as_ref().map(|dict| {
+            if dict.get_hex_u64("v").unwrap_or(0) < 6 {
+                Ok(None)
+            } else {
+                crate::filter::NetworkRules::from_dictionary(dict).map(Some)
+            }
+        });
         if let Some(net) = self.find_network_mut(nc.network_id) {
             net.pending_config_request = false;
             net.config_failure = ConfigFailure::None;
             net.credentials_pushed.clear();
             net.broadcast_enabled = broadcast_enabled;
             net.multicast_limit = multicast_limit;
+            match rules {
+                Some(Ok(rules)) => {
+                    match &rules {
+                        Some(rules) => net
+                            .peer_credentials
+                            .values_mut()
+                            .for_each(|credentials| credentials.clean(rules)),
+                        None => net.peer_credentials.clear(),
+                    }
+                    net.rules = rules;
+                }
+                // Upstream rejects a config whose rules do not parse; keep
+                // filtering with the last good ones.
+                Some(Err(error)) => tracing::warn!(
+                    target: "manytier",
+                    event = "network_rules_rejected",
+                    network_id = %format_args!("{:016x}", nc.network_id),
+                    error = ?error,
+                    "network config rules did not parse; keeping the previous rules"
+                ),
+                None => {}
+            }
         }
         self.refresh_multicast_groups(nc.network_id);
         self.actions.push(NodeAction::NetworkConfigured {
@@ -2411,6 +2512,7 @@ impl Node {
             com_count = creds.coms.len(),
             "NETWORK_CREDENTIALS received"
         );
+        self.add_peer_tags_and_capabilities(&creds.sections);
         for com in creds.coms {
             if com.issued_to != source {
                 continue;
@@ -3761,6 +3863,57 @@ fn inet_v6_from_bytes(data: &[u8]) -> Option<(Option<(Ipv6Addr, u8)>, usize)> {
         InetAddress::Null => Some((None, consumed)),
         InetAddress::V6 { ip, port } => Some((Some((Ipv6Addr::from(ip), port as u8)), consumed)),
         InetAddress::V4 { .. } => None,
+    }
+}
+
+/// Our capabilities then tags as the trailing sections of as few
+/// NETWORK_CREDENTIALS packets as hold them (always at least one).
+fn credential_sections(
+    capabilities: &[crate::controller::rules::CapabilityCredential],
+    tags: &[crate::controller::rules::TagCredential],
+) -> Vec<Vec<u8>> {
+    // What one packet holds besides its header and our COM.
+    const ROOM: usize = ZT_MAX_PACKET_FRAGMENTS * ZT_DEFAULT_PHYSMTU - 1024;
+    fn take(
+        items: &mut core::iter::Peekable<vec::IntoIter<Vec<u8>>>,
+        used: &mut usize,
+    ) -> (u16, Vec<u8>) {
+        let (mut count, mut bytes) = (0, Vec::new());
+        while let Some(item) = items.next_if(|item| *used == 0 || *used + item.len() <= ROOM) {
+            *used += item.len();
+            bytes.extend_from_slice(&item);
+            count += 1;
+        }
+        (count, bytes)
+    }
+    let encoded = |write: &dyn Fn(&mut Vec<u8>)| {
+        let mut buf = Vec::new();
+        write(&mut buf);
+        buf
+    };
+    let mut caps = capabilities
+        .iter()
+        .map(|cap| encoded(&|buf| cap.serialize(buf)))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .peekable();
+    let mut tags = tags
+        .iter()
+        .map(|tag| encoded(&|buf| tag.serialize(buf)))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .peekable();
+    let mut sections = Vec::new();
+    loop {
+        let mut used = 0;
+        let (cap_count, cap_bytes) = take(&mut caps, &mut used);
+        let (tag_count, tag_bytes) = take(&mut tags, &mut used);
+        sections.push(NetworkCredentialsPayload::sections_from(
+            cap_count, &cap_bytes, tag_count, &tag_bytes,
+        ));
+        if caps.peek().is_none() && tags.peek().is_none() {
+            return sections;
+        }
     }
 }
 
@@ -6825,5 +6978,254 @@ mod tests {
             NodeAction::WorldUpdated { world_id: 0x0000_00aa_bbcc_ddee, is_moon: true, data }
                 if World::deserialize(data).is_ok_and(|w| w.timestamp == 2_000)
         )));
+    }
+
+    fn config_payload(network_id: u64, dict: &Dictionary) -> NetworkConfigPayload {
+        NetworkConfigPayload {
+            network_id,
+            dict_data: dict.serialize(),
+            flags: None,
+            config_update_id: None,
+            total_length: None,
+            chunk_index: None,
+            signature_type: None,
+            signature: None,
+        }
+    }
+
+    /// Rules come from version 6 configs on; older ones carry none and
+    /// filter nothing, and rules that do not parse leave the last good
+    /// ones in force.
+    #[test]
+    fn network_config_rules_take_effect() {
+        use crate::controller::rules::{serialize_rules, Rule, ACTION_ACCEPT, MATCH_ETHERTYPE};
+
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let network_id = 0xfe00000000abcdef_u64;
+        node.join_network(NetworkMembership::new(network_id, 2800));
+        let accept = Rule {
+            rule_type: ACTION_ACCEPT,
+            not_flag: false,
+            or_flag: false,
+            value: vec![],
+        };
+        let apply = |node: &mut Node, version: u64, rules: Vec<u8>| {
+            let mut dict = Dictionary::new();
+            dict.add_hex("v", version);
+            dict.add_binary("R", rules);
+            node.apply_received_network_config(config_payload(network_id, &dict));
+            let net = node.find_network(network_id).unwrap();
+            net.rules.as_ref().map(|config| config.rules.clone())
+        };
+
+        let accept_all = serialize_rules(core::slice::from_ref(&accept));
+        assert_eq!(
+            apply(&mut node, 7, accept_all.clone()),
+            Some(vec![accept.clone()])
+        );
+        let truncated = vec![MATCH_ETHERTYPE, 2, 0x08];
+        assert_eq!(apply(&mut node, 7, truncated), Some(vec![accept]));
+        assert_eq!(apply(&mut node, 5, accept_all), None);
+    }
+
+    fn network_credentials_packet(from: &[u8; 5], to: &[u8; 5], sections: Vec<u8>) -> Vec<u8> {
+        let payload = NetworkCredentialsPayload {
+            coms: vec![],
+            sections,
+        };
+        let mut buf = vec![0u8; 16 + payload.sections.len()];
+        let len = payload.serialize(&mut buf);
+        let mut packet = vec![0u8; 28];
+        packet[8..13].copy_from_slice(to);
+        packet[13..18].copy_from_slice(from);
+        packet[27] = Verb::NetworkCredentials.to_byte();
+        packet.extend_from_slice(&buf[..len]);
+        packet
+    }
+
+    /// Tags and capabilities a member pushes are filed under the member
+    /// they were issued to, once the controller's signature checks out and
+    /// only on a network whose config has rules.
+    #[test]
+    fn network_credentials_file_member_tags_and_capabilities() {
+        use crate::controller::rules::{
+            serialize_capabilities_signed, serialize_tags_signed, Capability, Tag,
+        };
+
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let our_address = *node.identity.address.as_bytes();
+        let network_id = 0xfe00000000abcdef_u64;
+        node.join_network(NetworkMembership::new(network_id, 2800));
+        certify(&mut node, network_id, &[]);
+        let sender_id = test_identity(0x0e);
+        let sender = *sender_id.address.as_bytes();
+        node.topology.add_peer(sender_id);
+
+        let controller = controller_address_from_network_id(network_id);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let forger = ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]);
+        let tag = |id, key| {
+            let tag = Tag { id, value: id + 1 };
+            serialize_tags_signed(&[tag], network_id, &sender, &controller, 1000, key)
+        };
+        let tags = [tag(1, &key), tag(3, &forger)].concat();
+        let capability = Capability {
+            id: 9,
+            rules: vec![],
+        };
+        let caps = serialize_capabilities_signed(
+            &[capability],
+            network_id,
+            &sender,
+            &controller,
+            1000,
+            &key,
+        );
+        let sections = NetworkCredentialsPayload::sections_from(1, &caps, 2, &tags);
+        let from: SocketAddr = "192.168.1.1:9993".parse().unwrap();
+
+        let packet = network_credentials_packet(&sender, &our_address, sections.clone());
+        node.handle_network_credentials(&packet, from, 2000);
+        assert!(node
+            .find_network(network_id)
+            .unwrap()
+            .peer_credentials
+            .is_empty());
+
+        node.find_network_mut(network_id).unwrap().rules = Some(crate::filter::NetworkRules {
+            network_id,
+            ..Default::default()
+        });
+        node.handle_network_credentials(&packet, from, 4000);
+        let held = &node.find_network(network_id).unwrap().peer_credentials[&sender];
+        let tag_ids: Vec<u32> = held.tags.iter().map(|tag| tag.tag.id).collect();
+        let cap_ids: Vec<u32> = held
+            .capabilities
+            .iter()
+            .map(|cap| cap.capability.id)
+            .collect();
+        assert_eq!((tag_ids, cap_ids), (vec![1], vec![9]));
+    }
+
+    /// Our capabilities and tags from the config go out with our COM, as a
+    /// member reads them back.
+    #[test]
+    fn credentials_push_carries_our_capabilities_and_tags() {
+        use crate::controller::rules::{
+            deserialize_capabilities, deserialize_credential_sections, deserialize_tags,
+            serialize_capabilities_signed, serialize_tags_signed, Capability, Tag,
+        };
+
+        let planet = make_synthetic_planet();
+        let mut node = Node::new(test_identity(0x01), &planet, 1).unwrap();
+        let our_address = *node.identity.address.as_bytes();
+        let network_id = 0xfe00000000abcdef_u64;
+        node.join_network(NetworkMembership::new(network_id, 2800));
+        certify(&mut node, network_id, &[]);
+        let socket: SocketAddr = "203.0.113.43:9993".parse().unwrap();
+        let secret = [0x33; 48];
+        let peer = add_active_peer(&mut node, test_identity(0x79), socket, secret);
+
+        let controller = controller_address_from_network_id(network_id);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let capability = Capability {
+            id: 4,
+            rules: vec![],
+        };
+        let capabilities = deserialize_capabilities(&serialize_capabilities_signed(
+            &[capability],
+            network_id,
+            &our_address,
+            &controller,
+            1000,
+            &key,
+        ));
+        let tags = deserialize_tags(&serialize_tags_signed(
+            &[Tag { id: 1, value: 2 }, Tag { id: 5, value: 6 }],
+            network_id,
+            &our_address,
+            &controller,
+            1000,
+            &key,
+        ));
+        node.find_network_mut(network_id).unwrap().rules = Some(crate::filter::NetworkRules {
+            network_id,
+            capabilities: capabilities.clone(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+
+        let actions = node.credentials_if_needed(network_id, &peer, 2000);
+        let [NodeAction::SendTo { data, address }] = actions.as_slice() else {
+            panic!("one packet expected, got {actions:?}");
+        };
+        assert_eq!(*address, socket);
+        let mut packet = data.clone();
+        salsa::dearmor_packet(&secret, &mut packet).unwrap();
+        let payload = NetworkCredentialsPayload::deserialize(&packet[28..]).unwrap();
+        assert_eq!(payload.coms.len(), 1);
+        assert_eq!(
+            deserialize_credential_sections(&payload.sections).unwrap(),
+            (capabilities, tags)
+        );
+    }
+
+    /// Capabilities too many for one packet spread over several, tags
+    /// after them, none lost or repeated.
+    #[test]
+    fn credential_sections_spread_over_packets() {
+        use crate::controller::rules::{
+            deserialize_capabilities, deserialize_credential_sections, deserialize_tags,
+            serialize_capabilities_signed, serialize_tags_signed, Capability, Rule, Tag,
+            MATCH_MAC_SOURCE, MAX_CAPABILITY_RULES,
+        };
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let network_id = 0xfe00000000abcdef_u64;
+        let controller = controller_address_from_network_id(network_id);
+        let member = [0x0a; 5];
+        let mac_rule = Rule {
+            rule_type: MATCH_MAC_SOURCE,
+            not_flag: false,
+            or_flag: false,
+            value: vec![2; 6],
+        };
+        let caps: Vec<Capability> = (0..30)
+            .map(|id| Capability {
+                id,
+                rules: vec![mac_rule.clone(); MAX_CAPABILITY_RULES],
+            })
+            .collect();
+        let capabilities = deserialize_capabilities(&serialize_capabilities_signed(
+            &caps,
+            network_id,
+            &member,
+            &controller,
+            1000,
+            &key,
+        ));
+        let tags = deserialize_tags(&serialize_tags_signed(
+            &[Tag { id: 1, value: 2 }],
+            network_id,
+            &member,
+            &controller,
+            1000,
+            &key,
+        ));
+        assert_eq!(capabilities.len(), 30);
+
+        let sections = credential_sections(&capabilities, &tags);
+        assert!(sections.len() > 1, "{} sections", sections.len());
+        let (mut all_caps, mut all_tags) = (Vec::new(), Vec::new());
+        for section in &sections {
+            assert!(section.len() < ZT_MAX_PACKET_FRAGMENTS * ZT_DEFAULT_PHYSMTU - 1024);
+            let (caps, tags) = deserialize_credential_sections(section).unwrap();
+            all_caps.extend(caps);
+            all_tags.extend(tags);
+        }
+        assert_eq!((all_caps, all_tags), (capabilities, tags));
+        assert_eq!(credential_sections(&[], &[]).len(), 1);
     }
 }
