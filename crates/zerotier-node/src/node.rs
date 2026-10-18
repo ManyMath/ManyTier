@@ -291,6 +291,8 @@ pub struct Node {
     /// Our external address as each peer we HELLO'd directly reported it
     /// (ZeroTierOne SelfAwareness), keyed by that peer's address.
     external_surfaces: BTreeMap<SocketAddr, (SocketAddr, u64)>,
+    /// xorshift state behind the rules' MATCH_RANDOM.
+    pub(crate) filter_rng: u64,
 }
 
 impl Node {
@@ -329,6 +331,7 @@ impl Node {
             last_unite: BTreeMap::new(),
             expected_replies: ExpectedReplies::default(),
             external_surfaces: BTreeMap::new(),
+            filter_rng: (initial_packet_id ^ 0x9e37_79b9_7f4a_7c15) | 1,
         })
     }
 

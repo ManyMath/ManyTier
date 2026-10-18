@@ -23,6 +23,7 @@ use zerotier_protocol::verbs::ok::{OkPayload, OkSubPayload};
 
 use crate::arp;
 use crate::ethernet;
+use crate::filter::{self, FilterDecision, FilterEnv, Frame, Verdict};
 use crate::ndp;
 use crate::node::{Node, NodeAction};
 
@@ -104,6 +105,144 @@ fn push_fragmented_send(
     }
 }
 
+fn path_and_secret(node: &Node, address: &[u8; 5], now_ms: u64) -> Option<(SocketAddr, [u8; 48])> {
+    node.topology.get_peer(address).and_then(|peer| {
+        peer.best_path(now_ms)
+            .and_then(|path| peer.shared_secret().map(|secret| (path.address, *secret)))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum FilterDirection {
+    /// `no_tee` suppresses TEE and WATCH copies, as upstream does when it
+    /// filters a multicast once more per recipient.
+    Outbound {
+        no_tee: bool,
+    },
+    Inbound,
+}
+
+/// Run a frame through the network's rules, then send the TEE, WATCH and
+/// REDIRECT copies they ask for, as ZeroTierOne's Network::filterOutgoingPacket
+/// and filterIncomingPacket do. False when the frame itself must go no
+/// further. A network whose config carried no rules passes everything.
+fn filter_frame(
+    node: &mut Node,
+    actions: &mut Vec<NodeAction>,
+    network_id: u64,
+    frame: &Frame<'_>,
+    direction: FilterDirection,
+    now_ms: u64,
+) -> bool {
+    let Some(decision) = evaluate_rules(node, network_id, frame, direction) else {
+        return true;
+    };
+    send_filter_copies(node, actions, network_id, frame, &decision, now_ms);
+    if decision.verdict == Verdict::Drop {
+        tracing::debug!(
+            target: "manytier",
+            event = "vl2_frame_filtered",
+            inbound = matches!(direction, FilterDirection::Inbound),
+            redirected = decision.redirect.is_some(),
+            ethertype = frame.ethertype,
+            "network rules stopped a frame"
+        );
+        return false;
+    }
+    true
+}
+
+fn evaluate_rules(
+    node: &mut Node,
+    network_id: u64,
+    frame: &Frame<'_>,
+    direction: FilterDirection,
+) -> Option<FilterDecision> {
+    let net = node
+        .networks
+        .iter()
+        .find(|net| net.network_id == network_id)?;
+    let config = net.rules.as_ref()?;
+    // The other member: whose tags the rules compare ours with.
+    let peer = match direction {
+        FilterDirection::Outbound { .. } => frame.zt_dest,
+        FilterDirection::Inbound => Some(frame.zt_source),
+    };
+    let env = FilterEnv {
+        config,
+        our_address: *node.identity.address.as_bytes(),
+        peer: peer.and_then(|peer| net.peer_credentials.get(&peer)),
+        ownership: None,
+    };
+    let state = &mut node.filter_rng;
+    let mut rng = || {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state >> 32) as u32
+    };
+    Some(match direction {
+        FilterDirection::Outbound { no_tee } => {
+            filter::filter_outgoing(&env, frame, no_tee, &mut rng)
+        }
+        FilterDirection::Inbound => filter::filter_incoming(&env, frame, &mut rng),
+    })
+}
+
+fn send_filter_copies(
+    node: &mut Node,
+    actions: &mut Vec<NodeAction>,
+    network_id: u64,
+    frame: &Frame<'_>,
+    decision: &FilterDecision,
+    now_ms: u64,
+) {
+    let our_address = *node.identity.address.as_bytes();
+    for copy in decision.copies() {
+        if copy.to == our_address {
+            continue;
+        }
+        let Some((path_address, shared_secret)) = path_and_secret(node, &copy.to, now_ms) else {
+            actions.push(NodeAction::WhoisNeeded {
+                addresses: alloc::vec![copy.to],
+            });
+            continue;
+        };
+        let ext = ExtFramePayload {
+            network_id,
+            flags: copy.ext_frame_flags,
+            com: None,
+            dest_mac: frame.mac_dest,
+            src_mac: frame.mac_source,
+            ethertype: frame.ethertype,
+            payload: &frame.payload[..copy.length.min(frame.payload.len())],
+        };
+        let packet_id = node.allocate_packet_id();
+        if let Some(packet) =
+            build_ext_frame_packet(packet_id, &our_address, &copy.to, &ext, &shared_secret)
+        {
+            push_fragmented_send(actions, packet, path_address, ZT_DEFAULT_PHYSMTU);
+        }
+    }
+}
+
+/// Inbound counterpart of [`filter_frame`]; copies go out as node actions.
+fn filter_inbound(node: &mut Node, network_id: u64, frame: &Frame<'_>, now_ms: u64) -> bool {
+    let mut actions = Vec::new();
+    let pass = filter_frame(
+        node,
+        &mut actions,
+        network_id,
+        frame,
+        FilterDirection::Inbound,
+        now_ms,
+    );
+    for action in actions {
+        node.push_action(action);
+    }
+    pass
+}
+
 /// Handle an inbound FRAME verb (0x06).
 ///
 /// FRAME carries an Ethernet payload with implicit src/dest from the packet header.
@@ -144,7 +283,21 @@ pub fn handle_frame(
 
     // Derive MACs: sender MAC from sender's ZT address, dest MAC is our MAC
     let src_mac = ethernet::derive_mac(sender_address, frame.network_id);
-    let dest_mac = network.our_mac(node.identity.address.as_bytes());
+    let our_address = *node.identity.address.as_bytes();
+    let dest_mac = network.our_mac(&our_address);
+
+    let filtered = Frame {
+        zt_source: *sender_address,
+        zt_dest: Some(our_address),
+        mac_source: src_mac,
+        mac_dest: dest_mac,
+        ethertype: frame.ethertype,
+        vlan_id: 0,
+        payload: frame.payload,
+    };
+    if !filter_inbound(node, frame.network_id, &filtered, now_ms) {
+        return;
+    }
 
     if answer_address_resolution(
         node,
@@ -202,6 +355,19 @@ pub fn handle_ext_frame(
             from,
             now_ms,
         );
+        return;
+    }
+
+    let filtered = Frame {
+        zt_source: *sender_address,
+        zt_dest: Some(*node.identity.address.as_bytes()),
+        mac_source: ext.src_mac,
+        mac_dest: ext.dest_mac,
+        ethertype: ext.ethertype,
+        vlan_id: 0,
+        payload: ext.payload,
+    };
+    if !filter_inbound(node, ext.network_id, &filtered, now_ms) {
         return;
     }
 
@@ -414,6 +580,19 @@ pub fn handle_multicast_frame(
         .source_mac
         .unwrap_or_else(|| ethernet::derive_mac(sender_address, mf.network_id));
 
+    let filtered = Frame {
+        zt_source: *sender_address,
+        zt_dest: Some(*node.identity.address.as_bytes()),
+        mac_source: src_mac,
+        mac_dest: mf.dest_mac,
+        ethertype: mf.ethertype,
+        vlan_id: 0,
+        payload: mf.payload,
+    };
+    if !filter_inbound(node, mf.network_id, &filtered, now_ms) {
+        return;
+    }
+
     if answer_address_resolution(
         node,
         mf.network_id,
@@ -623,10 +802,10 @@ pub fn process_outbound_frame(
     actions
 }
 
-/// Send `payload` to one member as an EXT_FRAME. Our credentials go first
-/// when the member has not had them recently, as ZeroTier One does before
-/// every unicast (node/Switch.cpp `pushCredentialsIfNeeded`): a peer that
-/// lacks our COM drops the frame.
+/// Send `payload` to one member as an EXT_FRAME, if the network's rules
+/// let it go. Our credentials go first when the member has not had them
+/// recently, as ZeroTier One does before every unicast (node/Switch.cpp
+/// `pushCredentialsIfNeeded`): a peer that lacks our COM drops the frame.
 #[allow(clippy::too_many_arguments)]
 fn send_unicast_frame(
     node: &mut Node,
@@ -638,18 +817,27 @@ fn send_unicast_frame(
     payload: &[u8],
     now_ms: u64,
 ) {
-    let path_and_secret = node.topology.get_peer(&member_address).and_then(|peer| {
-        peer.best_path(now_ms)
-            .and_then(|path| peer.shared_secret().map(|secret| (path.address, *secret)))
-    });
-    let Some((path_address, shared_secret)) = path_and_secret else {
+    let our_zt_address = *node.identity.address.as_bytes();
+    let frame = Frame {
+        zt_source: our_zt_address,
+        zt_dest: Some(member_address),
+        mac_source: our_mac,
+        mac_dest: member_mac,
+        ethertype,
+        vlan_id: 0,
+        payload,
+    };
+    let outbound = FilterDirection::Outbound { no_tee: false };
+    if !filter_frame(node, actions, network_id, &frame, outbound, now_ms) {
+        return;
+    }
+    let Some((path_address, shared_secret)) = path_and_secret(node, &member_address, now_ms) else {
         actions.push(NodeAction::WhoisNeeded {
             addresses: alloc::vec![member_address],
         });
         return;
     };
     actions.extend(node.credentials_if_needed(network_id, &member_address, now_ms));
-    let our_zt_address = *node.identity.address.as_bytes();
     let ext = ExtFramePayload {
         network_id,
         flags: 0,
@@ -680,8 +868,9 @@ fn send_unicast_frame(
 
 /// Send `payload` as a MULTICAST_FRAME to the known members of a group
 /// (the network's multicast limit at most), as ZeroTier One's
-/// Multicaster::send does with the members it has gathered. Credentials go
-/// first where needed, as for unicast.
+/// Multicaster::send does with the members it has gathered. The rules see
+/// the frame once as a whole and once per recipient, as upstream's do.
+/// Credentials go first where needed, as for unicast.
 #[allow(clippy::too_many_arguments)]
 fn send_multicast_frame(
     node: &mut Node,
@@ -693,9 +882,25 @@ fn send_multicast_frame(
     now_ms: u64,
 ) {
     let our_zt_address = *node.identity.address.as_bytes();
-    let Some(limit) = node.find_network(network_id).map(|net| net.multicast_limit) else {
+    let Some((limit, our_mac)) = node
+        .find_network(network_id)
+        .map(|net| (net.multicast_limit, net.our_mac(&our_zt_address)))
+    else {
         return;
     };
+    let mut filtered = Frame {
+        zt_source: our_zt_address,
+        zt_dest: None,
+        mac_source: our_mac,
+        mac_dest: group_mac,
+        ethertype,
+        vlan_id: 0,
+        payload,
+    };
+    let outbound = FilterDirection::Outbound { no_tee: false };
+    if !filter_frame(node, actions, network_id, &filtered, outbound, now_ms) {
+        return;
+    }
     let targets = node.multicast_manager.get_replication_targets(
         network_id,
         &group_mac,
@@ -724,12 +929,12 @@ fn send_multicast_frame(
     body.truncate(body_len);
 
     for target in targets {
-        let Some((path_address, shared_secret)) =
-            node.topology.get_peer(&target).and_then(|peer| {
-                peer.best_path(now_ms)
-                    .and_then(|path| peer.shared_secret().map(|secret| (path.address, *secret)))
-            })
-        else {
+        filtered.zt_dest = Some(target);
+        let per_recipient = FilterDirection::Outbound { no_tee: true };
+        if !filter_frame(node, actions, network_id, &filtered, per_recipient, now_ms) {
+            continue;
+        }
+        let Some((path_address, shared_secret)) = path_and_secret(node, &target, now_ms) else {
             continue;
         };
         actions.extend(node.credentials_if_needed(network_id, &target, now_ms));
@@ -1876,5 +2081,258 @@ mod tests {
                 .get_subscribers(network_id, &[0xff; 6], 0, 10),
             vec![member]
         );
+    }
+
+    fn action_rule(rule_type: u8) -> crate::controller::rules::Rule {
+        crate::controller::rules::Rule {
+            rule_type,
+            not_flag: false,
+            or_flag: false,
+            value: vec![],
+        }
+    }
+
+    fn address_rule(
+        rule_type: u8,
+        fields: crate::controller::rules::RuleFields,
+    ) -> crate::controller::rules::Rule {
+        crate::controller::rules::Rule {
+            value: crate::controller::rules::encode_rule_fields(&fields),
+            ..action_rule(rule_type)
+        }
+    }
+
+    /// TEE, WATCH or REDIRECT to `to`, the whole frame.
+    fn forward_rule(rule_type: u8, to: &[u8; 5]) -> crate::controller::rules::Rule {
+        let fields = crate::controller::rules::RuleFields::Forward {
+            address: crate::controller::engine::zt_address_to_u64(to),
+            flags: 0,
+            length: 0,
+        };
+        address_rule(rule_type, fields)
+    }
+
+    fn network_rules(
+        rules: Vec<crate::controller::rules::Rule>,
+    ) -> Option<crate::filter::NetworkRules> {
+        Some(crate::filter::NetworkRules {
+            rules,
+            ..Default::default()
+        })
+    }
+
+    /// An active peer at `path` sharing `secret` with us.
+    fn add_reachable_peer(
+        node: &mut Node,
+        id: Identity,
+        path: SocketAddr,
+        secret: [u8; 48],
+    ) -> [u8; 5] {
+        let address = *id.address.as_bytes();
+        node.topology.add_peer(id);
+        let peer = node.topology.get_peer_mut(&address).unwrap();
+        peer.add_path(path, true, 1000);
+        peer.state = PeerState::new_active(secret, 10, 1000, 1000);
+        address
+    }
+
+    /// Where each EXT_FRAME in `actions` went, with its flags and payload.
+    fn ext_frames_sent(
+        actions: &[NodeAction],
+        secret: &[u8; 48],
+    ) -> Vec<(SocketAddr, u8, Vec<u8>)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                NodeAction::SendTo { data, address } => decrypted_verb(data, secret)
+                    .filter(|(verb, _)| *verb == Verb::ExtFrame)
+                    .map(|(_, body)| {
+                        let ext = ExtFramePayload::parse(&body).unwrap();
+                        (*address, ext.flags, ext.payload.to_vec())
+                    }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The network's rules decide whether a unicast goes out, before our
+    /// credentials do; TEE and REDIRECT send the frame to another member
+    /// as an EXT_FRAME with upstream's flags. A network without rules (a
+    /// static config) filters nothing.
+    #[test]
+    fn network_rules_gate_outbound_unicast() {
+        use crate::controller::rules::{ACTION_ACCEPT, ACTION_DROP, ACTION_REDIRECT, ACTION_TEE};
+
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let secret = [0x5a; 48];
+        let member_path: SocketAddr = "10.0.0.50:9993".parse().unwrap();
+        let observer_path: SocketAddr = "10.0.0.51:9993".parse().unwrap();
+        let member = add_reachable_peer(&mut node, test_identity(0x50), member_path, secret);
+        let observer = add_reachable_peer(&mut node, test_identity(0x51), observer_path, secret);
+        node.find_network_mut(network_id)
+            .unwrap()
+            .members
+            .push(NetworkMember {
+                zt_address: member,
+                mac: ethernet::derive_mac(&member, network_id),
+                ipv4: Some((Ipv4Addr::new(10, 147, 20, 2), 24)),
+                ipv6: None,
+                authorized: true,
+            });
+        let packet = ipv4_packet_to([10, 147, 20, 2]);
+        let send = |node: &mut Node, rules| {
+            node.find_network_mut(network_id).unwrap().rules = rules;
+            process_outbound_frame(node, network_id, 0x0800, &packet, &our_address, 2000)
+        };
+
+        let actions = send(&mut node, network_rules(vec![action_rule(ACTION_DROP)]));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, NodeAction::SendTo { .. })),
+            "a dropped frame sends nothing, credentials included: {actions:?}"
+        );
+        let actions = send(&mut node, network_rules(vec![]));
+        assert!(
+            ext_frames_sent(&actions, &secret).is_empty(),
+            "no rules match: drop"
+        );
+
+        let whole = |path| (path, 0u8, packet.clone());
+        let actions = send(&mut node, network_rules(vec![action_rule(ACTION_ACCEPT)]));
+        assert_eq!(ext_frames_sent(&actions, &secret), vec![whole(member_path)]);
+        let actions = send(&mut node, None);
+        assert_eq!(ext_frames_sent(&actions, &secret), vec![whole(member_path)]);
+
+        let tee = vec![
+            forward_rule(ACTION_TEE, &observer),
+            action_rule(ACTION_ACCEPT),
+        ];
+        let actions = send(&mut node, network_rules(tee));
+        assert_eq!(
+            ext_frames_sent(&actions, &secret),
+            vec![(observer_path, 0x02, packet.clone()), whole(member_path)]
+        );
+        let redirect = vec![forward_rule(ACTION_REDIRECT, &observer)];
+        let actions = send(&mut node, network_rules(redirect));
+        assert_eq!(
+            ext_frames_sent(&actions, &secret),
+            vec![(observer_path, 0x04, packet.clone())]
+        );
+    }
+
+    /// Inbound frames meet the same rules before delivery; an inbound TEE
+    /// or REDIRECT copy carries upstream's inbound flags.
+    #[test]
+    fn network_rules_gate_inbound_frames() {
+        use crate::controller::rules::{ACTION_ACCEPT, ACTION_DROP, ACTION_REDIRECT, ACTION_TEE};
+
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, signing_key, controller) = make_node_with_com(network_id);
+        let secret = [0x5b; 48];
+        let from: SocketAddr = "10.0.0.52:9993".parse().unwrap();
+        let observer_path: SocketAddr = "10.0.0.53:9993".parse().unwrap();
+        let sender = add_reachable_peer(&mut node, test_identity(0x52), from, secret);
+        let observer = add_reachable_peer(&mut node, test_identity(0x53), observer_path, secret);
+        add_peer_com(&mut node, network_id, &signing_key, &controller, &sender);
+        let ext = ExtFramePayload {
+            network_id,
+            flags: 0,
+            com: None,
+            dest_mac: node
+                .find_network(network_id)
+                .unwrap()
+                .our_mac(node.identity.address.as_bytes()),
+            src_mac: ethernet::derive_mac(&sender, network_id),
+            ethertype: 0x0800,
+            payload: &[0x45, 0, 0, 20],
+        };
+        let mut buf = [0u8; 256];
+        let n = ext.serialize(&mut buf);
+        let receive = |node: &mut Node, rules| {
+            node.find_network_mut(network_id).unwrap().rules = rules;
+            handle_ext_frame(node, &sender, &buf[..n], from, 2000, 1);
+            let actions = node.drain_actions();
+            let delivered = actions
+                .iter()
+                .any(|a| matches!(a, NodeAction::FrameReceived { .. }));
+            let copies: Vec<_> = ext_frames_sent(&actions, &secret)
+                .into_iter()
+                .map(|(path, flags, _)| (path, flags))
+                .collect();
+            (delivered, copies)
+        };
+
+        assert_eq!(
+            receive(&mut node, network_rules(vec![action_rule(ACTION_DROP)])),
+            (false, vec![])
+        );
+        assert_eq!(
+            receive(&mut node, network_rules(vec![action_rule(ACTION_ACCEPT)])),
+            (true, vec![])
+        );
+        let tee = vec![
+            forward_rule(ACTION_TEE, &observer),
+            action_rule(ACTION_ACCEPT),
+        ];
+        assert_eq!(
+            receive(&mut node, network_rules(tee)),
+            (true, vec![(observer_path, 0x08)])
+        );
+        let redirect = vec![forward_rule(ACTION_REDIRECT, &observer)];
+        assert_eq!(
+            receive(&mut node, network_rules(redirect)),
+            (false, vec![(observer_path, 0x0a)])
+        );
+    }
+
+    /// A multicast meets the rules once as a whole and again per recipient,
+    /// so a rule on the destination address leaves out just that member.
+    #[test]
+    fn multicast_rules_apply_per_recipient() {
+        use crate::controller::rules::{
+            RuleFields, ACTION_ACCEPT, ACTION_DROP, MATCH_DEST_ZEROTIER_ADDRESS,
+        };
+
+        let network_id = 0xfe00000000abcdef_u64;
+        let (mut node, _signing_key, _controller) = make_node_with_com(network_id);
+        let our_address = *node.identity.address.as_bytes();
+        let secret = [0x5c; 48];
+        let kept_path: SocketAddr = "10.0.0.54:9993".parse().unwrap();
+        let skipped_path: SocketAddr = "10.0.0.55:9993".parse().unwrap();
+        let kept = add_reachable_peer(&mut node, test_identity(0x54), kept_path, secret);
+        let skipped = add_reachable_peer(&mut node, test_identity(0x55), skipped_path, secret);
+        let group = [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb];
+        for member in [kept, skipped] {
+            node.multicast_manager
+                .subscribe(network_id, group, 0, member, 1000);
+        }
+        let skipped_u64 = crate::controller::engine::zt_address_to_u64(&skipped);
+        node.find_network_mut(network_id).unwrap().rules = network_rules(vec![
+            address_rule(
+                MATCH_DEST_ZEROTIER_ADDRESS,
+                RuleFields::ZtAddress(skipped_u64),
+            ),
+            action_rule(ACTION_DROP),
+            action_rule(ACTION_ACCEPT),
+        ]);
+
+        let mut v4 = [0u8; 20];
+        v4[0] = 0x45;
+        v4[16..20].copy_from_slice(&[224, 0, 0, 251]);
+        let actions =
+            process_outbound_frame(&mut node, network_id, 0x0800, &v4, &our_address, 2000);
+        let frames: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|action| match action {
+                NodeAction::SendTo { data, address } => decrypted_verb(data, &secret)
+                    .filter(|(verb, _)| *verb == Verb::MulticastFrame)
+                    .map(|_| *address),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![kept_path]);
     }
 }
